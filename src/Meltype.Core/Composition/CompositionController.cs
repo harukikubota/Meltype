@@ -177,6 +177,7 @@ public sealed record CompositionOptions
 
     /// <summary>句読点の組み合わせ (設定)。</summary>
     public Func<Config.PunctuationStyle> Punctuation { get; init; } = () => Config.PunctuationStyle.Japanese;
+    public Func<Config.SymbolWidth> SymbolWidth { get; init; } = () => Config.SymbolWidth.Auto;
 
     /// <summary>ユーザーが英字 / かなに直した語の学習。</summary>
     public LanguageMemory? Languages { get; init; }
@@ -762,6 +763,7 @@ public sealed class CompositionController
     {
         _text.KanaInput = _options.KanaInput();
         _text.Punctuation = _options.Punctuation();
+        _text.SymbolWidth = _options.SymbolWidth();
         var id = ++_compositionId;
         // 自分が確定した直後は、アプリ側のテキストがまだ更新されていないかもしれないので自分の記録を信じる。
         var recentOwnCommit = Environment.TickCount64 - _lastCommitTime < OwnCommitTrustMs;
