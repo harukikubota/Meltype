@@ -59,11 +59,24 @@ public sealed class CompositionText
     /// <summary>句読点の組み合わせ (設定)。, と . (かな入力の 、 。 のキー) で入れる文字。</summary>
     public PunctuationStyle Punctuation { get; set; } = PunctuationStyle.Japanese;
 
-    /// <summary>読点 (、 か ，)。</summary>
-    private char Comma => Punctuation is PunctuationStyle.FullWidthCommaPeriod or PunctuationStyle.FullWidthCommaKuten ? '，' : '、';
+    /// <summary>通常の ASCII 記号の幅。句読点と特殊ローマ字入力はそれぞれの設定・規則に従う。</summary>
+    public SymbolWidth SymbolWidth { get; set; } = SymbolWidth.Auto;
 
-    /// <summary>句点 (。 か ．)。</summary>
-    private char Period => Punctuation is PunctuationStyle.FullWidthCommaPeriod or PunctuationStyle.ToutenFullWidthPeriod ? '．' : '。';
+    /// <summary>読点 (、 / ， / ,)。</summary>
+    private char Comma => Punctuation switch
+    {
+        PunctuationStyle.HalfWidthCommaPeriod => ',',
+        PunctuationStyle.FullWidthCommaPeriod or PunctuationStyle.FullWidthCommaKuten => '，',
+        _ => '、',
+    };
+
+    /// <summary>句点 (。 / ． / .)。</summary>
+    private char Period => Punctuation switch
+    {
+        PunctuationStyle.HalfWidthCommaPeriod => '.',
+        PunctuationStyle.FullWidthCommaPeriod or PunctuationStyle.ToutenFullWidthPeriod => '．',
+        _ => '。',
+    };
 
     /// <summary>
     /// かな入力の 1 キー。raw はそのキーの英字 (英単語の判定と、英語として見せるときに使う)。
@@ -106,7 +119,7 @@ public sealed class CompositionText
                 _units[^1] = _units[^1] with { Kana = _units[^1].Raw };
         }
         // / を 3 つ続けて打ったら … (三点リーダー)。URL (file:///) の : の後ろは除く。
-        if (c == '/' && _pending.Length == 0 && _units.Count >= 2 && _units[^1].Raw == "/" && _units[^2].Raw == "/" &&
+        if (SymbolWidth == SymbolWidth.Auto && c == '/' && _pending.Length == 0 && _units.Count >= 2 && _units[^1].Raw == "/" && _units[^2].Raw == "/" &&
             !(_units.Count >= 3 && _units[^3].Raw == ":"))
         {
             _units.RemoveRange(_units.Count - 2, 2);
@@ -185,7 +198,7 @@ public sealed class CompositionText
             return;
         }
         // 、 や 。 を 3 つ続けたら ... にする (、、、 → ...)。
-        if (c is ',' or '.')
+        if (SymbolWidth == SymbolWidth.Auto && Punctuation != PunctuationStyle.HalfWidthCommaPeriod && c is ',' or '.')
         {
             var run = 0;
             while (run < _units.Count && _units[^(run + 1)].Raw is "," or ".") run++;
@@ -198,7 +211,7 @@ public sealed class CompositionText
         }
         // / キーで中黒 (設定): かなのすぐ後ろの / は ・ (いろん/ますく → いろん・ますく)。英字・数字の後ろ (and/or、3/4、URL)
         // と入力の始め (/help) は / のまま (issue #122)。英語の区間に入ったときは、打ったままの / を見せる。
-        if (c == '/' && SlashAsMiddleDot() && _units.Count > 0 && _units[^1].Kana is [.., var kana] && kana is >= 'ぁ' and <= 'ヺ' or 'ー')
+        if (SymbolWidth == SymbolWidth.Auto && c == '/' && SlashAsMiddleDot() && _units.Count > 0 && _units[^1].Kana is [.., var kana] && kana is >= 'ぁ' and <= 'ヺ' or 'ー')
         {
             _units.Add(new CompositionUnit("・", "/"));
             return;
@@ -646,7 +659,13 @@ public sealed class CompositionText
         if (partial)
         {
             // 構造の境界がローマ字単位の途中に入った場合だけ、その区間の原文を読み直す。
-            var fragment = new CompositionText(_detector);
+            var fragment = new CompositionText(_detector)
+            {
+                KanaInput = KanaInput,
+                Punctuation = Punctuation,
+                SymbolWidth = SymbolWidth,
+                SlashAsMiddleDot = SlashAsMiddleDot,
+            };
             foreach (var c in Raw[from..to]) fragment.Append(c);
             pending = fragment.Pending;
             return [.. fragment.Units];
@@ -1150,13 +1169,13 @@ public sealed class CompositionText
         return _detector.Romaji.ConvertLenient(pending.ToLowerInvariant(), final);
     }
 
-    /// <summary>日本語の中で打った記号 (Microsoft IME と同じく全角)。英語の区間では打ったままの半角で出す。数字と括弧は半角のまま。</summary>
+    /// <summary>日本語の中で打った記号。半角優先では句読点を除く ASCII 記号をそのまま出す。英語の区間は打ったまま。</summary>
     private char Symbol(char c) => c switch
     {
-        '-' => 'ー',
-        // 句読点は設定の組み合わせ (、。 / ，． / ，。 / 、．)。
         ',' => Comma,
         '.' => Period,
+        _ when SymbolWidth == SymbolWidth.HalfWidth && c is >= '!' and <= '~' && !char.IsAsciiLetterOrDigit(c) => c,
+        '-' => 'ー',
         '[' => '「',
         ']' => '」',
         // ASCII の括弧はチャット本文でもそのまま使われるため、入力した幅を保つ。

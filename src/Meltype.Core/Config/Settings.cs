@@ -83,7 +83,7 @@ public enum ConversionEngine
     [Description("Microsoft IME")] System,
 }
 
-/// <summary>句読点の組み合わせ (Microsoft IME と同じ 4 通り)。, と . を打ったときに出す文字。</summary>
+/// <summary>句読点の組み合わせ。, と . を打ったときに出す文字。</summary>
 public enum PunctuationStyle
 {
     /// <summary>既定。</summary>
@@ -92,6 +92,14 @@ public enum PunctuationStyle
     [Description("，．")] FullWidthCommaPeriod,
     [Description("，。")] FullWidthCommaKuten,
     [Description("、．")] ToutenFullWidthPeriod,
+    [Description(", . (半角)")] HalfWidthCommaPeriod,
+}
+
+/// <summary>日本語入力中の ASCII 記号の幅。句読点は Punctuation に従う。</summary>
+public enum SymbolWidth
+{
+    [Description("自動 (従来の動作)")] Auto,
+    [Description("半角を優先")] HalfWidth,
 }
 
 public enum InputMode
@@ -218,8 +226,12 @@ public sealed class Settings
     public bool SpaceAroundEnglish { get; set; }
 
     [Category("1. 全般"), DisplayName("句読点"),
-     Description("日本語の中で , と . を打ったときに出す句読点です (Microsoft IME と同じ 4 通り)。論文などで「，．」「，。」「、．」を使うときに変えます。かな入力の 、 。 のキーにも効きます。数字の間の . , (1.5、1,000) や英単語の中の . (tetr.io) は半角のままです。")]
+     Description("日本語の中で , と . を打ったときに出す句読点です。論文などで「，．」「，。」「、．」や半角の「, .」を使うときに変えます。かな入力の 、 。 のキーにも効きます。数字の間の . , (1.5、1,000) や英単語の中の . (tetr.io) は半角のままです。")]
     public PunctuationStyle Punctuation { get; set; } = PunctuationStyle.Japanese;
+
+    [Category("1. 全般"), DisplayName("記号の幅"),
+     Description("日本語入力中の ASCII 記号を半角のまま入力します。半角を優先すると [ ]、引用符、バッククォート、-、\\、/ もそのままになり、/// の三点リーダー化や / の中黒化を行いません。, と . は句読点設定に従います。z/ などの特殊ローマ字入力、空白、F9 や候補で明示的に選んだ全角表記は変わりません。")]
+    public SymbolWidth SymbolWidth { get; set; } = SymbolWidth.Auto;
 
     [Category("1. 全般"), DisplayName("ライブ変換"),
      Description("Keyboard モードで、Space を押さなくても打ったそばから漢字に変換して表示します。")]
