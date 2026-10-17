@@ -526,6 +526,44 @@ internal static class SessionFacadeTests
     }
 
     [Test]
+    public static void CodeInput_ReusesSettingsForEachKeyAndObservesTheNextUpdate()
+    {
+        var settings = new Settings();
+        settings.CodeSingleComments.BuiltIn.Hash = false;
+        var reads = 0;
+        var session = new MeltypeSession(CompositionTests.Detector, new CompositionTests.FakeConverter(),
+            new CompositionOptions(), () => { reads++; return settings; }) { CodeInput = true };
+
+        reads = 0;
+        var direct = Type(session, "k", "# ")[0];
+        Assert.True(!direct.Consumed && direct.View is null && direct.Commits.Count == 0, "# 無効時は直接入力する");
+        Assert.Equal(1, reads, "同じキーの有効設定を、Sigilとコード判定で取り直さない");
+
+        settings = settings.Clone();
+        settings.CodeSingleComments.BuiltIn.Hash = true;
+        reads = 0;
+        var comment = Type(session, "k", "# ")[0];
+        Assert.True(comment.Consumed && comment.View is not null && session.IsComposing, "次のキーで # 有効の設定を使う");
+        Assert.Equal(1, reads, "次のキーでは差し替えた設定を取得する");
+    }
+
+    [Test]
+    public static void CodeInput_ClosingQuoteSharesOneSettingsReadAndCommitsOnce()
+    {
+        var reads = 0;
+        var settings = new Settings();
+        var session = new MeltypeSession(CompositionTests.Detector, new CompositionTests.FakeConverter(),
+            new CompositionOptions(), () => { reads++; return settings; }) { CodeInput = true };
+        Assert.Equal("きょうは", Type(session, "kyouha", "x = \"")[^1].View?.Text);
+
+        reads = 0;
+        var closed = Type(session, "\"")[0];
+        Assert.Equal(1, reads, "引用符前後の判定は同じ設定で行う");
+        Assert.True(!closed.Consumed && closed.View is null && !session.IsComposing, "閉じる引用符は直接入力");
+        Assert.Equal("きょうは", closed.Commits.Single().Text, "未確定文字だけを一度確定する");
+    }
+
+    [Test]
     public static void CodeInput_HashDirectivesStayDirectDuringSequentialInput()
     {
         foreach (var surrounding in new[] { true, false })

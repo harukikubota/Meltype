@@ -358,14 +358,17 @@ public sealed class MeltypeSession
         if (CodeInput && !_controller.IsComposing) before = SyncCodeLine(before);
         // 文字列を閉じる引用符は英数のままアプリに通す (打っている途中の日本語は確定する。空の文字列 "" を閉じるときも)
         if (CodeInput && !Direct && !control && !alt && !command &&
-            ch is '"' or '\'' or '`' && _codeLine.Text is { } line &&
-            LineContext.ClassifyText(line, CodeSingleComments) == LineKind.String &&
-            LineContext.ClassifyText(line + ch, CodeSingleComments) == LineKind.Code)
+            ch is '"' or '\'' or '`' && _codeLine.Text is { } line)
         {
-            var committed = _controller.IsComposing ? CommitPending() : new SessionResult(false, [], null);
-            foreach (var edit in committed.Commits) _codeLine.Append(edit.Text);
-            TrackCodeKey(vk, ch, false);
-            return committed with { Consumed = false };
+            var comments = CodeSingleComments;
+            if (LineContext.ClassifyText(line, comments) == LineKind.String &&
+                LineContext.ClassifyText(line + ch, comments) == LineKind.Code)
+            {
+                var committed = _controller.IsComposing ? CommitPending() : new SessionResult(false, [], null);
+                foreach (var edit in committed.Commits) _codeLine.Append(edit.Text);
+                TrackCodeKey(vk, ch, false);
+                return committed with { Consumed = false };
+            }
         }
         _host.Begin(ch, shift, before, after);
         var down = new KeyEvent(vk, ch ?? 0, false, false, false, _timeMs());
@@ -382,13 +385,13 @@ public sealed class MeltypeSession
             return Track(_host.Result(consumed: false), vk, ch, modifier);
         }
         // 先頭か空白の直後の /command・$skill・@ファイル名 は、変換せずにそのままアプリへ渡す (#193)。
-        if (!modifier && !_controller.IsComposing && ch is { } c && _settings().SigilWordsDirect && _sigil.PassesThrough(c, before))
+        if (!modifier && !_controller.IsComposing && ch is { } c && settings.SigilWordsDirect && _sigil.PassesThrough(c, before))
         {
             if (CodeInput) TrackCodeKey(vk, ch, modifier);
             return Track(_host.Result(consumed: false), vk, ch, modifier);
         }
         if (CodeInput && !_codeJapanese && !_controller.IsComposing &&
-            (before is null || LineContext.ClassifyForInput(before, modifier ? null : ch, CodeSingleComments) == LineKind.Code))
+            (before is null || LineContext.ClassifyForInput(before, modifier ? null : ch, settings.CodeSingleComments) == LineKind.Code))
         {
             TrackCodeKey(vk, ch, modifier);
             return Track(_host.Result(consumed: false), vk, ch, modifier);

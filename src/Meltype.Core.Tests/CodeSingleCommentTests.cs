@@ -77,6 +77,112 @@ internal static class CodeSingleCommentTests
     }
 
     [Test]
+    public static void MatchingOrderDoesNotChangeLongestCompletePrefix()
+    {
+        var comments = CustomOnly(
+            new CodeSingleComment { Token = "!" },
+            new CodeSingleComment { Token = "!!" },
+            new CodeSingleComment { Token = "!!=" },
+            new CodeSingleComment { Token = "!!!!!!!!=" });
+        for (var order = 0; order < 2; order++)
+        {
+            Assert.Equal("!!=", LineContext.MatchSingleComment("value !! = !!=note", 11, false, comments), "途中の位置でも最長の完全一致");
+            Assert.Equal("!!", LineContext.MatchSingleComment("!!!!!!!?", 0, true, comments), "長い同先頭候補が末尾で不一致なら短い完全一致");
+            Assert.Equal("!", LineContext.MatchSingleComment("!~", 0, true, comments), "短い候補に完全一致する");
+            Assert.Equal<string?>(null, LineContext.MatchSingleComment("value", 0, true, comments));
+            comments.Custom.Reverse();
+        }
+    }
+
+    [Test]
+    public static void NonCandidateAndNonAsciiTextDoesNotHideLaterMatches()
+    {
+        var comments = CustomOnly(new CodeSingleComment { Token = "%" }, new CodeSingleComment { Token = "!!!!!!!!=" });
+        var prefix = new string('a', 8192) + " 日本語🙂 ";
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText(prefix, comments), "候補先頭を含まない長い行");
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText(prefix + "!!!!!!!?", comments), "長い候補の不完全な一致");
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText(prefix + "% note", comments), "非ASCII部分より後ろも走査する");
+        Assert.Equal<string?>(null, LineContext.MatchSingleComment("日%", 0, true, comments), "非ASCII文字は候補先頭にならない");
+        Assert.Equal<string?>(null, LineContext.MatchSingleComment("🙂%", 0, true, comments), "サロゲートも候補先頭にならない");
+        Assert.Equal("%", LineContext.MatchSingleComment("🙂%", 2, false, comments));
+    }
+
+    [Test]
+    public static void DirectSettingMutationsApplyOnTheNextClassification()
+    {
+        var token = new CodeSingleComment { Token = "%%", Enabled = false };
+        var comments = CustomOnly(token, new CodeSingleComment { Token = "!!", Enabled = false });
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("%% !!", comments), "全件無効");
+        token.Enabled = true;
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("%% note", comments));
+        token.Token = "@@";
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("%% note", comments), "同じ要素の文字列編集を反映");
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("@@ note", comments));
+        comments.Custom.Add(new CodeSingleComment { Token = "%%" });
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("%% note", comments), "同じリストへの追加を反映");
+        comments.Custom.RemoveAt(2);
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("%% note", comments), "同じリストからの削除を反映");
+        comments.Custom[1].Enabled = true;
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("!! note", comments));
+        comments.Custom.Clear();
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("@@ !!", comments), "全削除後に古い候補を残さない");
+        comments.Custom = [new CodeSingleComment { Token = "??" }];
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("?? note", comments), "リストの差替えも反映");
+        comments.BuiltIn = new BuiltInCodeSingleComments();
+        foreach (var text in new[] { "// note", "# note", "-- note", "REM note" })
+            Assert.Equal(LineKind.Comment, LineContext.ClassifyText(text, comments), text);
+        comments.BuiltIn.SlashSlash = comments.BuiltIn.Hash = comments.BuiltIn.DoubleHyphen = comments.BuiltIn.Rem = false;
+        foreach (var text in new[] { "// note", "# note", "-- note", "REM note" })
+            Assert.Equal(LineKind.Code, LineContext.ClassifyText(text, comments), text);
+    }
+
+    [Test]
+    public static void CloneAndProfileChangesUseTheirOwnCommentRules()
+    {
+        var original = new Settings { CodeSingleComments = CustomOnly(new CodeSingleComment { Token = "%" }) }.Normalize();
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("% note", original.CodeSingleComments));
+        var cloned = original.Clone();
+        cloned.CodeSingleComments.Custom[0].Token = "@@";
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("% note", cloned.CodeSingleComments));
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("@@ note", cloned.CodeSingleComments));
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("% note", original.CodeSingleComments));
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("@@ note", original.CodeSingleComments));
+
+        var other = original.AddProfile("別の設定")!;
+        other.CodeSingleComments.Custom[0].Token = "!!";
+        other.CodeSingleComments.BuiltIn.Hash = true;
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("!! note", other.CodeSingleComments));
+        var restored = other.SwitchProfile(Settings.DefaultProfileName);
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("% note", restored.CodeSingleComments));
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("!! note", restored.CodeSingleComments));
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("# note", restored.CodeSingleComments));
+        var returned = restored.SwitchProfile("別の設定");
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText("% note", returned.CodeSingleComments));
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("!! note", returned.CodeSingleComments));
+        Assert.Equal(LineKind.Comment, LineContext.ClassifyText("# note", returned.CodeSingleComments));
+    }
+
+    [Test]
+    public static void LongMultiLineScanPreservesClosingBoundariesAndPromptPriority()
+    {
+        var comments = CustomOnly(
+            new CodeSingleComment { Token = "%" }, new CodeSingleComment { Token = "*/" },
+            new CodeSingleComment { Token = "-->" }, new CodeSingleComment { Token = "\"" }, new CodeSingleComment { Token = ">" });
+        var history = string.Concat(Enumerable.Repeat("value = 1;\r\n", 256));
+        foreach (var block in new[] { ("/*", "*/"), ("<!--", "-->"), ("\"\"\"", "\"\"\"") })
+        {
+            var closed = history + block.Item1 + " block\n" + block.Item2;
+            Assert.Equal(LineKind.Code, LineContext.ClassifyText(closed + "value", comments), "複数行ブロック終端を独自トークンとして再解釈しない");
+            Assert.Equal(LineKind.Comment, LineContext.ClassifyText(closed + "% note", comments), "ブロック終端直後のトークンは見落とさない");
+        }
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText(history + "% /* \"\"\"\nvalue", comments), "行コメント内のブロック開始を無視する");
+        Assert.Equal(LineKind.String, LineContext.ClassifyText(history + "\"% note", comments));
+        Assert.Equal(LineKind.Code, LineContext.ClassifyText(history + "\"% note\"", comments));
+        Assert.Equal(LineKind.Prompt, LineContext.ClassifyText(history + "│ > % note", comments), "Promptはトークンより優先");
+        Assert.Equal(LineKind.Prompt, LineContext.ClassifyText(history + "│ › 日本語", comments));
+    }
+
+    [Test]
     public static void StringsAndExistingBlocksTakePriority()
     {
         var comments = CustomOnly(new CodeSingleComment { Token = "%" }, new CodeSingleComment { Token = "/" }, new CodeSingleComment { Token = "<" }, new CodeSingleComment { Token = "\"" });
