@@ -497,6 +497,35 @@ internal static class SessionFacadeTests
     }
 
     [Test]
+    public static void CodeSingleComment_SettingsControlSessionInputImmediately()
+    {
+        var settings = new Settings();
+        var session = new MeltypeSession(CompositionTests.Detector, new CompositionTests.FakeConverter(), new CompositionOptions(), () => settings);
+        session.CodeInput = true;
+        Assert.True(session.CodeEnglishAt("% "), "既定では % は英数");
+        settings.CodeSingleComments.Custom.Add(new CodeSingleComment { Token = "%", Enabled = true });
+        Assert.True(!session.CodeEnglishAt("% "), "有効化した設定を同じセッションで使う");
+        Assert.True(!session.SetCodeLine(true, "% "), "コメント中はコードの日本語切替を行わない");
+        Assert.Equal("きょうは", Type(session, "kyouha", "% ")[^1].View?.Text);
+        Type(session, "\n");
+        settings.CodeSingleComments.Custom.Single(c => c.Token == "%").Enabled = false;
+        Assert.True(session.CodeEnglishAt("% "), "無効化も即時反映する");
+        Assert.True(Type(session, "kyouha", "% ").All(r => !r.Consumed), "無効なら英数を通す");
+        settings.CodeSingleComments.BuiltIn.SlashSlash = false;
+        Assert.True(session.CodeEnglishAt("// "), "既定のトークンも無効化できる");
+        settings.CodeSingleComments.BuiltIn.Hash = false;
+        Assert.True(Type(session, "kyouha", "# ").All(r => !r.Consumed), "# 無効時は入力キー判定でも英数を通す");
+        settings.CodeSingleComments.BuiltIn.Rem = false;
+        Assert.True(Type(session, "kyouha", "REM ").All(r => !r.Consumed), "REM 無効時は英数を通す");
+        settings.CodeSingleComments.BuiltIn.Rem = true;
+        Assert.Equal("きょうは", Type(session, "kyouha", "rem ")[^1].View?.Text);
+        Type(session, "\n");
+        settings.CodeSingleComments.Custom = [new() { Token = "@@" }];
+        Assert.True(!session.CodeEnglishAt("@@ "), "一覧の差替えを反映する");
+        Assert.True(session.CodeEnglishAt("@@ note\nvalue"), "行コメントは改行を越えない");
+    }
+
+    [Test]
     public static void CodeInput_HashDirectivesStayDirectDuringSequentialInput()
     {
         foreach (var surrounding in new[] { true, false })

@@ -129,6 +129,7 @@ public sealed class MeltypeSession
     private readonly CompositionController _controller;
     private readonly Host _host = new();
     private readonly Func<Settings> _settings;
+    private CodeSingleCommentSettings CodeSingleComments => _settings().CodeSingleComments;
     private readonly Func<long> _timeMs;
     private readonly SigilWord _sigil = new();
     private readonly bool _directModeDetection;
@@ -301,7 +302,7 @@ public sealed class MeltypeSession
             Diagnostics.Log.Info("コードの行: 英数に戻す");
             return true;
         }
-        if (_codeJapanese || before is not null && LineContext.ClassifyText(before) != LineKind.Code) return false;
+        if (_codeJapanese || before is not null && LineContext.ClassifyText(before, CodeSingleComments) != LineKind.Code) return false;
         _codeJapanese = true;
         Diagnostics.Log.Info("コードの行: 日本語で入力 (改行しても続ける。キャレットが別の場所に移るか、もう一度押すまで)");
         return true;
@@ -315,7 +316,7 @@ public sealed class MeltypeSession
     {
         if (!CodeInput || Direct || _controller.IsComposing) return false;
         before = SyncCodeLine(before);
-        return !_codeJapanese && LineContext.ClassifyText(before ?? "") == LineKind.Code;
+        return !_codeJapanese && LineContext.ClassifyText(before ?? "", CodeSingleComments) == LineKind.Code;
     }
 
     /// <summary>
@@ -358,8 +359,8 @@ public sealed class MeltypeSession
         // 文字列を閉じる引用符は英数のままアプリに通す (打っている途中の日本語は確定する。空の文字列 "" を閉じるときも)
         if (CodeInput && !Direct && !control && !alt && !command &&
             ch is '"' or '\'' or '`' && _codeLine.Text is { } line &&
-            LineContext.ClassifyText(line) == LineKind.String &&
-            LineContext.ClassifyText(line + ch) == LineKind.Code)
+            LineContext.ClassifyText(line, CodeSingleComments) == LineKind.String &&
+            LineContext.ClassifyText(line + ch, CodeSingleComments) == LineKind.Code)
         {
             var committed = _controller.IsComposing ? CommitPending() : new SessionResult(false, [], null);
             foreach (var edit in committed.Commits) _codeLine.Append(edit.Text);
@@ -387,7 +388,7 @@ public sealed class MeltypeSession
             return Track(_host.Result(consumed: false), vk, ch, modifier);
         }
         if (CodeInput && !_codeJapanese && !_controller.IsComposing &&
-            (before is null || LineContext.ClassifyForInput(before, modifier ? null : ch) == LineKind.Code))
+            (before is null || LineContext.ClassifyForInput(before, modifier ? null : ch, CodeSingleComments) == LineKind.Code))
         {
             TrackCodeKey(vk, ch, modifier);
             return Track(_host.Result(consumed: false), vk, ch, modifier);

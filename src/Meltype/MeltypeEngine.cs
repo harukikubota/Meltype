@@ -427,7 +427,7 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             RequestLine(0);
             return true;
         }
-        return (nextCharacter is null ? LineContext.ClassifyText(line) : LineContext.ClassifyForInput(line, nextCharacter)) == LineKind.Code;
+        return (nextCharacter is null ? LineContext.ClassifyText(line, settings.CodeSingleComments) : LineContext.ClassifyForInput(line, nextCharacter, settings.CodeSingleComments)) == LineKind.Code;
     }
 
     /// <summary>
