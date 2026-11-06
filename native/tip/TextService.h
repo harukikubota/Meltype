@@ -128,6 +128,10 @@ private:
     void RewriteBeforeCaret(ITfContext* context, ITfRange* end, LONG count, const std::wstring& before, const std::wstring& text);
     // range を text で置き換えて確定する (アプリによっては変換中の文字としてでないと入らないので、いったん変換中にする)
     bool WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text);
+    // 確定の通知後、入力先・確定範囲・選択位置が変わっていなければ括弧の内側へ移る。
+    void MoveCaretAfterCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text, int caretBack, const JsonValue& remaining);
+    // 一時コンテキストで ← の配送後に、同じ応答の残りを反映するための内部キーか。
+    bool IsCaretContinuation(UINT vk) const;
     void ApplyComposition(TfEditCookie ec, ITfContext* context, const JsonValue& view);
     void ShowCandidates(TfEditCookie ec, ITfContext* context, const JsonValue& view);
     void EndComposition(TfEditCookie ec);
@@ -142,7 +146,7 @@ private:
     void ResumeOrCommit(ITfContext* context);
     void CommitInSession(TfEditCookie ec, ITfContext* context, bool keepAppCaret);
     void SelectCandidate(int index, bool prediction);
-    void Reinject(UINT vk);
+    bool Reinject(UINT vk, bool unmodified = false, ULONG_PTR continuationMarker = 0);
     void SurroundingText(TfEditCookie ec, ITfContext* context, std::wstring& before, std::wstring& after);
     bool ContextDisabled(ITfContext* context);
     void AdviseTextEditSink(ITfDocumentMgr* documentMgr);
@@ -242,6 +246,8 @@ private:
     bool privateField_ = false;    // 前に入力欄の種類を読んだとき、入力を覚えないように求める入力欄 (IS_PRIVATE) だった
     const wchar_t* scopeSource_ = nullptr;  // 入力欄の種類を前に読んだところ (ログ用)
     bool keepAppCaret_ = false;    // 確定したあと、キャレットを動かさない (クリック・別の入力欄で確定したとき)
+    ULONG_PTR caretContinuationSerial_ = 0;
+    std::function<void(ITfContext*)> afterCaret_; // ← の配送後に続く確定・未確定表示。別の入力が来たら破棄する
     bool deactivated_ = false;     // 終わった後は Meltype.exe とやり取りしない
     const wchar_t* passReason_ = nullptr;  // 最後にキーを通した理由 (ログに同じ理由を続けて書かない)
     bool keyFailed_ = false;

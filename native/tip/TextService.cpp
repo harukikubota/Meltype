@@ -344,6 +344,7 @@ STDMETHODIMP TextService::ActivateEx(ITfThreadMgr* threadMgr, TfClientId clientI
 }
 
 STDMETHODIMP TextService::Deactivate() {
+    afterCaret_ = {};
     StopHelloUpdates();
     UnpreserveShortcuts();
     TipLog(L"Deactivate");
@@ -1097,6 +1098,10 @@ bool TextService::IsReinjected(UINT vk) {
 
 STDMETHODIMP TextService::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     UINT vk = static_cast<UINT>(wParam);
+    if (IsCaretContinuation(vk)) {
+        *eaten = TRUE;
+        return S_OK;
+    }
     if (IsReinjected(vk)) {
         passVk_ = vk;  // アプリによっては、このあと OnKeyDown も呼ぶ
         passTime_ = GetTickCount64();
@@ -1106,6 +1111,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPAR
         return S_OK;
     }
     passVk_ = 0;
+    if (!IsModifier(vk)) afterCaret_ = {};
     wchar_t ch = 0;
     *eaten = WouldEat(context, vk, lParam, ch, true) ? TRUE : FALSE;
     // アプリにそのまま渡すキー (BackSpace・矢印・Enter・Space など) はキャレットを動かす: 前に確定した語を確定し直さない
@@ -1118,6 +1124,14 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPAR
 
 STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     UINT vk = static_cast<UINT>(wParam);
+    if (IsCaretContinuation(vk)) {
+        *eaten = TRUE;
+        eatenDown_[vk] = true;
+        auto apply = std::move(afterCaret_);
+        afterCaret_ = {};
+        apply(context);
+        return S_OK;
+    }
     if ((vk == passVk_ && GetTickCount64() - passTime_ < 500) || IsReinjected(vk)) {
         passVk_ = 0;
         directEnglishWord_ = false;
@@ -1126,6 +1140,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
     passVk_ = 0;
+    if (!IsModifier(vk)) afterCaret_ = {};
     wchar_t ch = 0;
     if (!WouldEat(context, vk, lParam, ch, false)) {
         if (!IsModifier(vk)) {
@@ -1371,8 +1386,8 @@ void TextService::ApplyMode(const JsonValue& reply) {
     UpdateLangBar();
 }
 
-void TextService::Reinject(UINT vk) {
-    // 受け取ったキーを使わなかった: アプリに送り直す (Ctrl などは押されたままなので、組み合わせもそのまま届く)
+bool TextService::Reinject(UINT vk, bool unmodified, ULONG_PTR continuationMarker) {
+    // アプリにキーを送り直す。通常は修飾を保ち、カーソル移動 (unmodified) だけは修飾を外して復元する。
     eatenDown_[vk] = false;
     // 前に送り直した同じキーがまだ届いていない (見分けられずに受け取ってしまった) のに、また送り直そうとしている:
     // 自分の送り直しを受け取っては送り直すのを繰り返しているかもしれない。続くなら、アプリが固まらないように送り直すのをやめる。
@@ -1390,7 +1405,7 @@ void TextService::Reinject(UINT vk) {
     }
     if (previousPending && ++reinjectGuardCount_ > 3) {
         TipLog(L"同じキーの送り直しが続くので、やめます");
-        return;
+        return false;
     }
     // まだ届いていない送り直しの続きに覚える (いっぱいなら一番古いものを捨てる)
     Reinjected* slot = &reinjected_[0];
@@ -1403,23 +1418,48 @@ void TextService::Reinject(UINT vk) {
     }
     slot->vk = vk;
     slot->time = GetTickCount64();
-    INPUT inputs[2] = {};
-    for (int i = 0; i < 2; i++) {
-        inputs[i].type = INPUT_KEYBOARD;
-        inputs[i].ki.wVk = static_cast<WORD>(vk);
-        inputs[i].ki.wScan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
-        inputs[i].ki.dwFlags = i == 1 ? KEYEVENTF_KEYUP : 0;
-        inputs[i].ki.dwExtraInfo = kReinjectMarker;
-        if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN || vk == VK_HOME || vk == VK_END || vk == VK_PRIOR ||
-            vk == VK_NEXT || vk == VK_INSERT || vk == VK_DELETE) {
-            inputs[i].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    std::vector<INPUT> inputs;
+    auto append = [&](UINT key, bool up) {
+        INPUT input = {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = static_cast<WORD>(key);
+        input.ki.wScan = static_cast<WORD>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC));
+        input.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        input.ki.dwExtraInfo = kReinjectMarker;
+        if (key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN || key == VK_HOME || key == VK_END || key == VK_PRIOR ||
+            key == VK_NEXT || key == VK_INSERT || key == VK_DELETE || key == VK_RCONTROL) {
+            input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        inputs.push_back(input);
+    };
+    std::vector<UINT> held;
+    if (unmodified) {
+        // Ctrl+Enter・Shift+Enter の修飾を ← に引き継がない。解除・移動・復元は 1 回の SendInput にまとめる。
+        // Ctrl を先に解除し、Shift を先に復元して、Ctrl+Shift の Shift 押下を新しく作らない。
+        for (UINT key : {VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT}) {
+            if ((GetAsyncKeyState(static_cast<int>(key)) & 0x8000) == 0) continue;
+            held.push_back(key);
+            append(key, true);
         }
     }
+    append(vk, false);
+    append(vk, true);
+    for (auto key = held.rbegin(); key != held.rend(); ++key) append(*key, false);
+    if (continuationMarker != 0) {
+        // ← の keydown/up をアプリが処理した後に TIP で続ける。遅延時間では配送順を推測しない。
+        append(VK_NONAME, false);
+        inputs.back().ki.dwExtraInfo = continuationMarker;
+        append(VK_NONAME, true);
+        inputs.back().ki.dwExtraInfo = continuationMarker;
+    }
     // 送り込みを許されていないとき (UIPI) は、失敗しても分からないことがある。分かったときだけログに書く
-    if (SendInput(2, inputs, sizeof(INPUT)) != 2) {
+    const UINT count = static_cast<UINT>(inputs.size());
+    if (SendInput(count, inputs.data(), sizeof(INPUT)) != count) {
         slot->vk = 0;
         TipLog(L"キーをアプリに送り直せません: %lu", GetLastError());
+        return false;
     }
+    return true;
 }
 
 bool TextService::Request(const std::string& json, JsonValue& reply, DWORD timeoutMs, bool optional) {
@@ -1473,9 +1513,12 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
     // 1 つの応答の中の確定は、前の確定の後ろに続けて入れる (クリックで確定したときは、キャレットがもうクリックした所にあるので、
     // キャレットの位置に入れると、クリックした所に入ったり、選んでいた文字を上書きしたりする)
     Microsoft::WRL::ComPtr<ITfRange> next;
-    for (const JsonValue& edit : reply[L"commits"].array) {
+    const auto& edits = reply[L"commits"].array;
+    for (size_t index = 0; index < edits.size(); index++) {
+        const JsonValue& edit = edits[index];
         const std::wstring& text = edit[L"text"].Str();
         int deleteBefore = edit[L"deleteBefore"].Int();
+        int caretBack = edit[L"caretBack"].Int();
         const JsonValue& current = edit[L"current"];
         // 変換中は範囲外の確定語を置換せず、今の変換を保持する (今確定した語がある確定し直しは、下で今の語を確定してから書き換える)。
         if (deleteBefore > 0 && composition_ != nullptr && current.type != JsonValue::Type::String) continue;
@@ -1506,6 +1549,16 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
             // 関係ない文字を消したり、古い文字に重ねて入れたりしないように、確定し直さない (変換中の文字は、次の確定でそのまま確定する)
             if (deleteBefore > 0 && !ExtendOverPrevious(ec, range.Get(), deleteBefore, edit[L"expect"])) continue;
             if (!WriteCommit(ec, context, range.Get(), text)) continue;
+        }
+        if (!keepAppCaret_ && caretBack > 0) {
+            // 同じ応答に次の打ちかけ (例: []、Space、k) があっても、移動前に変換を始めない。
+            JsonValue remaining = reply;
+            auto& commits = remaining.object[L"commits"].array;
+            commits.erase(commits.begin(), commits.begin() + index + 1);
+            const auto& written = deleteBefore > 0 && current.type == JsonValue::Type::String ? current.Str() : text;
+            MoveCaretAfterCommit(ec, context, range.Get(), written, caretBack, remaining);
+            if (candidates_) candidates_->Hide();
+            return;
         }
         next.Reset();
         if (SUCCEEDED(range->Clone(&next))) next->Collapse(ec, TF_ANCHOR_END);
@@ -1611,6 +1664,138 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
     }
     EndComposition(ec);
     return written;
+}
+
+bool TextService::IsCaretContinuation(UINT vk) const {
+    return vk == VK_NONAME && afterCaret_ &&
+        GetMessageExtraInfo() == static_cast<LPARAM>(reinterpret_cast<ULONG_PTR>(this) ^ caretContinuationSerial_);
+}
+
+void TextService::MoveCaretAfterCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text, int caretBack, const JsonValue& remaining) {
+    Microsoft::WRL::ComPtr<ITfRange> committed;
+    if (static_cast<size_t>(caretBack) > text.size() || FAILED(range->Clone(&committed)) ||
+        FAILED(committed->SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD))) {
+        return;
+    }
+    Microsoft::WRL::ComPtr<TextService> self = this;
+    Microsoft::WRL::ComPtr<ITfContext> target = context;
+    GUITHREADINFO requestedFocus = {sizeof(requestedFocus)};
+    const HWND focusedWindow = GetGUIThreadInfo(GetCurrentThreadId(), &requestedFocus) ? requestedFocus.hwndFocus : nullptr;
+    const auto revision = serverStateRevision_;
+    const auto passed = passedTime_;
+    RunEditSession(context, clientId_, TF_ES_ASYNC | TF_ES_READWRITE, [self, target, committed, text, caretBack, remaining, focusedWindow, revision, passed](TfEditCookie cookie) {
+        TF_STATUS status = {};
+        if (FAILED(target->GetStatus(&status))) return S_OK;
+        // 待っている間に別の入力欄へ移った・次の入力を始めた場合は、カーソルを奪わない。
+        Microsoft::WRL::ComPtr<ITfDocumentMgr> document;
+        Microsoft::WRL::ComPtr<ITfContext> focused;
+        if (self->threadMgr_ == nullptr || self->composition_ != nullptr ||
+            self->serverStateRevision_ != revision || self->passedTime_ != passed ||
+            FAILED(self->threadMgr_->GetFocus(&document)) || !document ||
+            FAILED(document->GetTop(&focused)) || focused.Get() != target.Get()) {
+            return S_OK;
+        }
+        TF_SELECTION selection = {};
+        ULONG fetched = 0;
+        HRESULT result = target->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+        if (FAILED(result) || fetched == 0) {
+            return S_OK;
+        }
+        Microsoft::WRL::ComPtr<ITfRange> current;
+        current.Attach(selection.range);
+        BOOL empty = FALSE, same = FALSE;
+        if (FAILED(current->IsEmpty(cookie, &empty)) || !empty ||
+            FAILED(current->IsEqualEnd(cookie, committed.Get(), TF_ANCHOR_END, &same)) || !same) {
+            return S_OK;
+        }
+        std::wstring actual(text.size() + 1, L'\0');
+        ULONG length = 0;
+        result = committed->GetText(cookie, 0, actual.data(), static_cast<ULONG>(actual.size()), &length);
+        if (FAILED(result) || length != text.size() || actual.compare(0, length, text) != 0) {
+            return S_OK;
+        }
+        if ((status.dwStaticFlags & TF_SS_TRANSITORY) != 0) {
+            // 一時コンテキストの選択位置は文書本体のカーソルではない。確定後の ← をアプリへ渡す。
+            // 別アプリ・別ウィンドウへの送り込みと、Alt/Win と組み合わさる操作は行わない。
+            GUITHREADINFO foreground = {sizeof(foreground)};
+            if (focusedWindow == nullptr || !GetGUIThreadInfo(0, &foreground) || foreground.hwndFocus != focusedWindow ||
+                KeyDown(VK_MENU) || KeyDown(VK_LWIN) || KeyDown(VK_RWIN) ||
+                ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000) != 0) {
+                return S_OK;
+            }
+            ULONG_PTR marker = 0;
+            const bool continues = !remaining[L"commits"].array.empty() || !remaining[L"view"].IsNull();
+            if (continues) {
+                ++self->caretContinuationSerial_;
+                marker = reinterpret_cast<ULONG_PTR>(self.Get()) ^ self->caretContinuationSerial_;
+                // this はメンバー関数から呼ぶ間だけ使う。self を保持すると自身を参照し続けるため、捕捉しない。
+                auto* service = self.Get();
+                self->afterCaret_ = [service, target, remaining, focusedWindow, revision, passed](ITfContext* input) {
+                    GUITHREADINFO focus = {sizeof(focus)};
+                    if (input != target.Get() || service->deactivated_ || service->composition_ != nullptr ||
+                        service->serverStateRevision_ != revision || service->passedTime_ != passed ||
+                        !GetGUIThreadInfo(0, &focus) || focus.hwndFocus != focusedWindow) return;
+                    RunEditSession(input, service->clientId_, TF_ES_SYNC | TF_ES_READWRITE, [&](TfEditCookie nextCookie) {
+                        service->ownEdit_ = true;
+                        service->Apply(nextCookie, input, remaining);
+                        return S_OK;
+                    });
+                };
+            }
+            for (int i = 0; i < caretBack; i++) {
+                if (!self->Reinject(VK_LEFT, true, i + 1 == caretBack ? marker : 0)) {
+                    self->afterCaret_ = {};
+                    return S_OK;
+                }
+            }
+            self->caretMoved_ = true;
+            if (!continues) self->Apply(cookie, target.Get(), remaining);
+            return S_OK;
+        }
+        Microsoft::WRL::ComPtr<ITfRange> caretRange;
+        LONG moved = 0;
+        auto position = [&]() -> HRESULT {
+            HRESULT hr = committed->Clone(&caretRange);
+            if (FAILED(hr)) return hr;
+            hr = caretRange->Collapse(cookie, TF_ANCHOR_START);
+            if (FAILED(hr)) return hr;
+            // 先頭から前進し、負方向の移動数の符号に依存せず内側の位置を作る。
+            const LONG offset = static_cast<LONG>(text.size()) - caretBack;
+            hr = caretRange->ShiftEnd(cookie, offset, &moved, nullptr);
+            if (FAILED(hr)) return hr;
+            if (moved != offset) return E_FAIL;
+            hr = caretRange->Collapse(cookie, TF_ANCHOR_END);
+            if (FAILED(hr)) return hr;
+            TF_SELECTION caret = {};
+            caret.range = caretRange.Get();
+            // NONE (アクティブ端なし) ではなく、操作を受ける末尾を明示する。
+            caret.style.ase = TF_AE_END;
+            caret.style.fInterimChar = FALSE;
+            self->ownEdit_ = true;
+            hr = target->SetSelection(cookie, 1, &caret);
+            if (FAILED(hr)) return hr;
+            TF_SELECTION checked = {};
+            ULONG count = 0;
+            hr = target->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &checked, &count);
+            if (FAILED(hr)) return hr;
+            if (count != 1 || checked.range == nullptr) return E_FAIL;
+            Microsoft::WRL::ComPtr<ITfRange> selected;
+            selected.Attach(checked.range);
+            BOOL collapsed = FALSE, atTarget = FALSE;
+            hr = selected->IsEmpty(cookie, &collapsed);
+            if (FAILED(hr)) return hr;
+            hr = selected->IsEqualEnd(cookie, caretRange.Get(), TF_ANCHOR_END, &atTarget);
+            if (FAILED(hr)) return hr;
+            return collapsed && atTarget ? S_OK : E_FAIL;
+        };
+        result = position();
+        if (SUCCEEDED(result)) {
+            self->caretMoved_ = true;
+            self->Apply(cookie, target.Get(), remaining);
+        }
+        else self->ownEdit_ = false;
+        return S_OK;
+    });
 }
 
 void TextService::ApplyComposition(TfEditCookie ec, ITfContext* context, const JsonValue& view) {
