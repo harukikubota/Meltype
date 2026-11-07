@@ -47,9 +47,7 @@ LRESULT CALLBACK ObserveQueuedImmMessage(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-void LogBracketContext(ITfContext* context, int caretBack, const JsonValue& reply) {
-    TF_STATUS status = {};
-    const HRESULT statusResult = context->GetStatus(&status);
+void LogBracketContext(ITfContext* context, const TF_STATUS& status, HRESULT statusResult, int caretBack, const JsonValue& reply) {
     Microsoft::WRL::ComPtr<ITfContextView> view;
     HWND window = nullptr;
     HRESULT windowResult = context->GetActiveView(&view);
@@ -1563,12 +1561,26 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
     // 1 つの応答の中の確定は、前の確定の後ろに続けて入れる (クリックで確定したときは、キャレットがもうクリックした所にあるので、
     // キャレットの位置に入れると、クリックした所に入ったり、選んでいた文字を上書きしたりする)
     Microsoft::WRL::ComPtr<ITfRange> next;
-    for (const JsonValue& edit : reply[L"commits"].array) {
+    const auto& commits = reply[L"commits"].array;
+    const JsonValue& view = reply[L"view"];
+    for (const JsonValue& edit : commits) {
         const std::wstring& text = edit[L"text"].Str();
         int deleteBefore = edit[L"deleteBefore"].Int();
         int caretBack = edit[L"caretBack"].Int();
         const bool traceCaret = caretBack > 0 && TipLoggingEnabled();
-        if (traceCaret) LogBracketContext(context, caretBack, reply);
+        if (caretBack > 0) {
+            const bool continues = &edit != &commits.back() || !view[L"text"].Str().empty();
+            if (continues || traceCaret) {
+                TF_STATUS status = {};
+                const HRESULT result = context->GetStatus(&status);
+                if (traceCaret) LogBracketContext(context, status, result, caretBack, reply);
+                // Chromium は次の変換の開始位置を確定範囲の境界に使う。括弧内で変換を始めると閉じ括弧が欠ける。
+                if (continues && SUCCEEDED(result) && (status.dwStaticFlags & TF_SS_TRANSITORY) != 0) {
+                    caretBack = 0;
+                    if (traceCaret) TipLog(L"括弧検証 一時コンテキストの後続入力を確定末尾に反映");
+                }
+            }
+        }
         const JsonValue& current = edit[L"current"];
         // 変換中は範囲外の確定語を置換せず、今の変換を保持する (今確定した語がある確定し直しは、下で今の語を確定してから書き換える)。
         if (deleteBefore > 0 && composition_ != nullptr && current.type != JsonValue::Type::String) continue;
@@ -1609,7 +1621,6 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
         else if (SUCCEEDED(range->Clone(&next))) next->Collapse(ec, TF_ANCHOR_END);
     }
 
-    const JsonValue& view = reply[L"view"];
     lastConverting_ = !view.IsNull() && view[L"converting"].Bool();
     if (!view.IsNull() && !view[L"text"].Str().empty()) {
         ApplyComposition(ec, context, view);
