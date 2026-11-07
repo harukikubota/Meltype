@@ -1459,7 +1459,7 @@ void TextService::ApplyMode(const JsonValue& reply) {
     UpdateLangBar();
 }
 
-void TextService::Reinject(UINT vk) {
+bool TextService::Reinject(UINT vk) {
     // 受け取ったキーを使わなかった: アプリに送り直す (Ctrl などは押されたままなので、組み合わせもそのまま届く)
     eatenDown_[vk] = false;
     // 前に送り直した同じキーがまだ届いていない (見分けられずに受け取ってしまった) のに、また送り直そうとしている:
@@ -1478,7 +1478,7 @@ void TextService::Reinject(UINT vk) {
     }
     if (previousPending && ++reinjectGuardCount_ > 3) {
         TipLog(L"同じキーの送り直しが続くので、やめます");
-        return;
+        return false;
     }
     // まだ届いていない送り直しの続きに覚える (いっぱいなら一番古いものを捨てる)
     Reinjected* slot = &reinjected_[0];
@@ -1507,7 +1507,9 @@ void TextService::Reinject(UINT vk) {
     if (SendInput(2, inputs, sizeof(INPUT)) != 2) {
         slot->vk = 0;
         TipLog(L"キーをアプリに送り直せません: %lu", GetLastError());
+        return false;
     }
+    return true;
 }
 
 bool TextService::Request(const std::string& json, JsonValue& reply, DWORD timeoutMs, bool optional) {
@@ -1567,18 +1569,21 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
         const std::wstring& text = edit[L"text"].Str();
         int deleteBefore = edit[L"deleteBefore"].Int();
         int caretBack = edit[L"caretBack"].Int();
+        int caretAfterCommit = 0;
         const bool traceCaret = caretBack > 0 && TipLoggingEnabled();
         if (caretBack > 0) {
+            TF_STATUS status = {};
+            const HRESULT result = context->GetStatus(&status);
+            if (traceCaret) LogBracketContext(context, status, result, caretBack, reply);
             const bool continues = &edit != &commits.back() || !view[L"text"].Str().empty();
-            if (continues || traceCaret) {
-                TF_STATUS status = {};
-                const HRESULT result = context->GetStatus(&status);
-                if (traceCaret) LogBracketContext(context, status, result, caretBack, reply);
-                // Chromium は次の変換の開始位置を確定範囲の境界に使う。括弧内で変換を始めると閉じ括弧が欠ける。
-                if (continues && SUCCEEDED(result) && (status.dwStaticFlags & TF_SS_TRANSITORY) != 0) {
-                    caretBack = 0;
+            if (SUCCEEDED(result) && (status.dwStaticFlags & TF_SS_TRANSITORY) != 0) {
+                if (continues) {
+                    // Chromium は次の変換の開始位置を確定範囲の境界に使う。括弧内で変換を始めると閉じ括弧が欠ける。
                     if (traceCaret) TipLog(L"括弧検証 一時コンテキストの後続入力を確定末尾に反映");
+                } else if (deleteBefore == 0 && !keepAppCaret_ && reply[L"consumed"].Bool()) {
+                    caretAfterCommit = caretBack;
                 }
+                caretBack = 0;
             }
         }
         const JsonValue& current = edit[L"current"];
@@ -1615,6 +1620,7 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
             // 関係ない文字を消したり、古い文字に重ねて入れたりしないように、確定し直さない (変換中の文字は、次の確定でそのまま確定する)
             if (deleteBefore > 0 && !ExtendOverPrevious(ec, range.Get(), deleteBefore, edit[L"expect"])) continue;
             if (!WriteCommit(ec, context, range.Get(), text, caretBack, &movedCaret)) continue;
+            if (caretAfterCommit > 0) MoveCaretAfterCommit(ec, context, range.Get(), text, caretAfterCommit);
         }
         next.Reset();
         if (movedCaret) next = std::move(movedCaret);
@@ -1639,6 +1645,67 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
         if (candidates_) candidates_->Hide();
     }
     StartConversionWait();
+}
+
+void TextService::MoveCaretAfterCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text, int count) {
+    const HWND window = GetFocus();
+    Microsoft::WRL::ComPtr<ITfRange> committed;
+    if (window == nullptr || static_cast<size_t>(count) > text.size() || FAILED(range->Clone(&committed)) ||
+        FAILED(committed->SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD))) {
+        TipLog(L"括弧検証 確定後の移動を依頼できません: 入力先または確定範囲を取得できません");
+        return;
+    }
+    Microsoft::WRL::ComPtr<TextService> self = this;
+    Microsoft::WRL::ComPtr<ITfContext> target = context;
+    const auto revision = serverStateRevision_;
+    const auto passed = passedTime_;
+    const HRESULT result = RunEditSession(context, clientId_, TF_ES_ASYNC | TF_ES_READ, [self, target, committed, text, count, window, revision, passed](TfEditCookie cookie) {
+        Microsoft::WRL::ComPtr<ITfDocumentMgr> document;
+        Microsoft::WRL::ComPtr<ITfContext> focused;
+        if (self->deactivated_ || self->threadMgr_ == nullptr || self->composition_ != nullptr ||
+            self->serverStateRevision_ != revision || self->passedTime_ != passed ||
+            FAILED(self->threadMgr_->GetFocus(&document)) || !document ||
+            FAILED(document->GetTop(&focused)) || !SameObject(focused.Get(), target.Get())) {
+            TipLog(L"括弧検証 確定後の移動を中止: 入力先または入力状態が変化");
+            return S_OK;
+        }
+        TF_SELECTION selection = {};
+        ULONG fetched = 0;
+        if (FAILED(target->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0 || selection.range == nullptr) {
+            TipLog(L"括弧検証 確定後の移動を中止: 選択位置を取得できません");
+            return S_OK;
+        }
+        Microsoft::WRL::ComPtr<ITfRange> current;
+        current.Attach(selection.range);
+        BOOL empty = FALSE, same = FALSE;
+        if (FAILED(current->IsEmpty(cookie, &empty)) || !empty ||
+            FAILED(current->IsEqualEnd(cookie, committed.Get(), TF_ANCHOR_END, &same)) || !same) {
+            TipLog(L"括弧検証 確定後の移動を中止: 選択位置が確定末尾と一致しません");
+            return S_OK;
+        }
+        std::wstring actual(text.size() + 1, L'\0');
+        ULONG length = 0;
+        if (FAILED(committed->GetText(cookie, 0, actual.data(), static_cast<ULONG>(actual.size()), &length)) ||
+            length != text.size() || actual.compare(0, length, text) != 0) {
+            TipLog(L"括弧検証 確定後の移動を中止: 確定文字が一致しません");
+            return S_OK;
+        }
+        GUITHREADINFO foreground = {sizeof(foreground)};
+        if (!GetGUIThreadInfo(0, &foreground) || foreground.hwndFocus != window ||
+            ((GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU) |
+              GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN) |
+              GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000) != 0) {
+            TipLog(L"括弧検証 確定後の移動を中止: フォーカスまたは修飾キー・マウスの状態");
+            return S_OK;
+        }
+        for (int i = 0; i < count; ++i) {
+            if (!self->Reinject(VK_LEFT)) return S_OK;
+            self->caretMoved_ = true;
+        }
+        TipLog(L"括弧検証 確定後の左キーを送信: 回数=%d", count);
+        return S_OK;
+    });
+    TipLog(L"括弧検証 確定後の移動を依頼: 結果=0x%08lX", static_cast<unsigned long>(result));
 }
 
 bool TextService::ExtendOverPrevious(TfEditCookie ec, ITfRange* range, LONG count, const JsonValue& expect) {
