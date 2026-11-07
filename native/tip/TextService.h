@@ -127,7 +127,7 @@ private:
     // 次の編集セッションで、キャレットの前の count 文字が before のままなら text に書き換えて確定する
     void RewriteBeforeCaret(ITfContext* context, ITfRange* end, LONG count, const std::wstring& before, const std::wstring& text);
     // range を text で置き換えて確定する (アプリによっては変換中の文字としてでないと入らないので、いったん変換中にする)
-    bool WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text);
+    bool WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text, int caretBack = 0);
     // 確定の通知後、入力先・確定範囲・選択位置が変わっていなければ括弧の内側へ移る。
     void MoveCaretAfterCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text, int caretBack, const JsonValue& remaining);
     // 一時コンテキストで ← の配送後に、同じ応答の残りを反映するための内部キーか。

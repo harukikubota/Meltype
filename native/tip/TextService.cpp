@@ -1537,7 +1537,7 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
             // 確定し直し (今確定した語つき): 今の語をふつうに確定してから、次の編集セッションで、前に確定した文字ごと書き換える。
             // 同じ編集セッションで変換中の文字の外も書き換えると、Chrome はページに変換の終わり (compositionend) を伝えない。
             // 変換中の範囲を前に広げて書き換えると、Chrome では TF_E_RANGE_NOT_COVERED で失敗する (#262)
-            if (!WriteCommit(ec, context, range.Get(), current.Str())) continue;
+            if (!WriteCommit(ec, context, range.Get(), current.Str(), caretBack)) continue;
             const JsonValue& expect = edit[L"expect"];
             // 今の語の後ろの位置を覚えておき、書き換えるときにキャレットがそこにあるかを確かめる (後ろに文字が入っても動かないように、両端とも前に寄せる)
             Microsoft::WRL::ComPtr<ITfRange> end;
@@ -1548,7 +1548,7 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
             // 確定し直し: 前に確定した文字を消して入れ直す。前の文字が確定したときのままでなければ (アプリが書き換えた・前の文字を読めない)、
             // 関係ない文字を消したり、古い文字に重ねて入れたりしないように、確定し直さない (変換中の文字は、次の確定でそのまま確定する)
             if (deleteBefore > 0 && !ExtendOverPrevious(ec, range.Get(), deleteBefore, edit[L"expect"])) continue;
-            if (!WriteCommit(ec, context, range.Get(), text)) continue;
+            if (!WriteCommit(ec, context, range.Get(), text, caretBack)) continue;
         }
         if (!keepAppCaret_ && caretBack > 0) {
             // 同じ応答に次の打ちかけ (例: []、Space、k) があっても、移動前に変換を始めない。
@@ -1633,7 +1633,7 @@ void TextService::RewriteBeforeCaret(ITfContext* context, ITfRange* end, LONG co
     });
 }
 
-bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text) {
+bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* range, const std::wstring& text, int caretBack) {
     if (composition_ == nullptr) {
         ITfContextComposition* contextComposition = nullptr;
         if (SUCCEEDED(context->QueryInterface(IID_ITfContextComposition, reinterpret_cast<void**>(&contextComposition)))) {
@@ -1657,7 +1657,8 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
             caretRange->Collapse(ec, TF_ANCHOR_END);
             TF_SELECTION caret = {};
             caret.range = caretRange.Get();
-            caret.style.ase = TF_AE_NONE;
+            // 括弧内への移動を続ける確定だけ、末尾をアクティブにする。通常入力の指定は変えない。
+            caret.style.ase = caretBack > 0 ? TF_AE_END : TF_AE_NONE;
             caret.style.fInterimChar = FALSE;
             context->SetSelection(ec, 1, &caret);
         }
