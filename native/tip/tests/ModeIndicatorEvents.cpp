@@ -14,6 +14,7 @@ LONG g_locks = 0;
 int indicatorRequests = 0;
 std::atomic<bool> indicatorEnabled = false;
 int helloApplied = 0;
+bool TipLoggingEnabled() { return false; }
 void TipLog(const wchar_t* format, ...) {
     // ApplyHello が設定を反映した後に出す接続状態のログを待機条件に使う。
     if (std::wcscmp(format, L"Meltype.exe: %s") == 0) ++helloApplied;

@@ -3,6 +3,7 @@
 
 #include "TextService.h"
 
+#include <imm.h>
 #include <InputScope.h>
 #include <wrl/client.h>
 
@@ -14,6 +15,68 @@
 
 namespace meltype {
 namespace {
+
+// WM_IME_COMPOSITION の wParam や確定文字列は読まず、通知の種類だけを記録する。
+void LogImmMessage(const wchar_t* hook, HWND window, UINT message, LPARAM flags) {
+    const wchar_t* kind = nullptr;
+    switch (message) {
+        case WM_IME_STARTCOMPOSITION: kind = L"WM_IME_STARTCOMPOSITION"; break;
+        case WM_IME_COMPOSITION: kind = L"WM_IME_COMPOSITION"; break;
+        case WM_IME_ENDCOMPOSITION: kind = L"WM_IME_ENDCOMPOSITION"; break;
+        default: return;
+    }
+    const DWORD error = GetLastError();
+    TipLog(L"括弧検証 IMM通知: hook=%s hwnd=%p %s result=%d", hook, static_cast<void*>(window), kind,
+           message == WM_IME_COMPOSITION && (flags & GCS_RESULTSTR) != 0);
+    SetLastError(error);
+}
+
+LRESULT CALLBACK ObserveSentImmMessage(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        const auto* message = reinterpret_cast<const CWPSTRUCT*>(lParam);
+        LogImmMessage(L"WH_CALLWNDPROC", message->hwnd, message->message, message->lParam);
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+LRESULT CALLBACK ObserveQueuedImmMessage(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && wParam == PM_REMOVE) {
+        const auto* message = reinterpret_cast<const MSG*>(lParam);
+        LogImmMessage(L"WH_GETMESSAGE", message->hwnd, message->message, message->lParam);
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void LogBracketContext(ITfContext* context, int caretBack, const JsonValue& reply) {
+    TF_STATUS status = {};
+    const HRESULT statusResult = context->GetStatus(&status);
+    Microsoft::WRL::ComPtr<ITfContextView> view;
+    HWND window = nullptr;
+    HRESULT windowResult = context->GetActiveView(&view);
+    if (SUCCEEDED(windowResult) && view) windowResult = view->GetWnd(&window);
+    const int transitory = FAILED(statusResult) ? -1 : (status.dwStaticFlags & TF_SS_TRANSITORY) != 0;
+    TipLog(L"括弧検証 TSF: status=0x%08lX static=0x%08lX dynamic=0x%08lX 一時=%d view=0x%08lX hwnd=%p focus=%p 移動数=%d 確定数=%zu 未確定=%d 消費=%d",
+           static_cast<unsigned long>(statusResult), status.dwStaticFlags, status.dwDynamicFlags, transitory,
+           static_cast<unsigned long>(windowResult), static_cast<void*>(window), static_cast<void*>(GetFocus()), caretBack,
+           reply[L"commits"].array.size(), !reply[L"view"][L"text"].Str().empty(), reply[L"consumed"].Bool());
+}
+
+void LogBracketSelection(ITfContext* context, TfEditCookie ec, ITfRange* target, const wchar_t* stage) {
+    TF_SELECTION selection = {};
+    ULONG fetched = 0;
+    HRESULT result = context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+    int matches = -1;
+    if (SUCCEEDED(result) && fetched > 0 && selection.range != nullptr) {
+        Microsoft::WRL::ComPtr<ITfRange> range;
+        range.Attach(selection.range);
+        BOOL empty = FALSE;
+        BOOL same = FALSE;
+        result = range->IsEmpty(ec, &empty);
+        if (SUCCEEDED(result)) result = range->IsEqualEnd(ec, target, TF_ANCHOR_END, &same);
+        if (SUCCEEDED(result)) matches = empty && same;
+    }
+    TipLog(L"括弧検証 選択: 段階=%s 結果=0x%08lX 取得数=%lu 内側=%d", stage, static_cast<unsigned long>(result), fetched, matches);
+}
 
 class EditSession final : public ITfEditSession {
 public:
@@ -201,7 +264,29 @@ HRESULT RunEditSession(ITfContext* context, TfClientId clientId, DWORD flags, st
 
 TextService::TextService() { DllAddRef(); }
 
-TextService::~TextService() { StopHelloUpdates(); DllRelease(); }
+TextService::~TextService() {
+    StopImmDiagnostics();
+    StopHelloUpdates();
+    DllRelease();
+}
+
+void TextService::StartImmDiagnostics() {
+    if (!TipLoggingEnabled()) return;
+    const DWORD thread = GetCurrentThreadId();
+    immSentHook_ = SetWindowsHookExW(WH_CALLWNDPROC, ObserveSentImmMessage, nullptr, thread);
+    const DWORD sentError = immSentHook_ ? ERROR_SUCCESS : GetLastError();
+    immQueuedHook_ = SetWindowsHookExW(WH_GETMESSAGE, ObserveQueuedImmMessage, nullptr, thread);
+    const DWORD queuedError = immQueuedHook_ ? ERROR_SUCCESS : GetLastError();
+    TipLog(L"括弧検証 同期版 v1: WH_CALLWNDPROC=%d error=%lu WH_GETMESSAGE=%d error=%lu",
+           immSentHook_ != nullptr, sentError, immQueuedHook_ != nullptr, queuedError);
+}
+
+void TextService::StopImmDiagnostics() {
+    if (immSentHook_) UnhookWindowsHookEx(immSentHook_);
+    if (immQueuedHook_) UnhookWindowsHookEx(immQueuedHook_);
+    immSentHook_ = nullptr;
+    immQueuedHook_ = nullptr;
+}
 
 STDMETHODIMP TextService::QueryInterface(REFIID riid, void** ppv) {
     if (ppv == nullptr) return E_INVALIDARG;
@@ -239,6 +324,7 @@ STDMETHODIMP_(ULONG) TextService::Release() {
 STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId) { return ActivateEx(threadMgr, clientId, 0); }
 
 STDMETHODIMP TextService::ActivateEx(ITfThreadMgr* threadMgr, TfClientId clientId, DWORD flags) {
+    StopImmDiagnostics();
     threadMgr_ = threadMgr;
     threadMgr_->AddRef();
     clientId_ = clientId;
@@ -339,11 +425,15 @@ STDMETHODIMP TextService::ActivateEx(ITfThreadMgr* threadMgr, TfClientId clientI
         AdviseTextEditSink(focus);
         focus->Release();
     }
-    if (!disabled_) StartHelloUpdates();
+    if (!disabled_) {
+        StartImmDiagnostics();
+        StartHelloUpdates();
+    }
     return S_OK;
 }
 
 STDMETHODIMP TextService::Deactivate() {
+    StopImmDiagnostics();
     StopHelloUpdates();
     UnpreserveShortcuts();
     TipLog(L"Deactivate");
@@ -1477,6 +1567,8 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
         const std::wstring& text = edit[L"text"].Str();
         int deleteBefore = edit[L"deleteBefore"].Int();
         int caretBack = edit[L"caretBack"].Int();
+        const bool traceCaret = caretBack > 0 && TipLoggingEnabled();
+        if (traceCaret) LogBracketContext(context, caretBack, reply);
         const JsonValue& current = edit[L"current"];
         // 変換中は範囲外の確定語を置換せず、今の変換を保持する (今確定した語がある確定し直しは、下で今の語を確定してから書き換える)。
         if (deleteBefore > 0 && composition_ != nullptr && current.type != JsonValue::Type::String) continue;
@@ -1490,7 +1582,10 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
             ULONG fetched = 0;
             if (SUCCEEDED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) && fetched > 0) range.Attach(selection.range);
         }
-        if (!range) continue;
+        if (!range) {
+            if (traceCaret) TipLog(L"括弧検証 確定: 編集範囲を取得できません");
+            continue;
+        }
         Microsoft::WRL::ComPtr<ITfRange> movedCaret;
         if (deleteBefore > 0 && current.type == JsonValue::Type::String) {
             // 確定し直し (今確定した語つき): 今の語をふつうに確定してから、次の編集セッションで、前に確定した文字ごと書き換える。
@@ -1599,12 +1694,17 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
         attribute->Clear(ec, range);
         attribute->Release();
     }
-    bool written = SUCCEEDED(range->SetText(ec, 0, text.c_str(), static_cast<LONG>(text.size())));
+    const HRESULT writeResult = range->SetText(ec, 0, text.c_str(), static_cast<LONG>(text.size()));
+    const bool written = SUCCEEDED(writeResult);
+    const bool traceCaret = caretBack > 0 && TipLoggingEnabled();
+    Microsoft::WRL::ComPtr<ITfRange> diagnosticTarget;
+    if (traceCaret) TipLog(L"括弧検証 確定: SetText=0x%08lX アプリの選択を保持=%d", static_cast<unsigned long>(writeResult), keepAppCaret_);
     // 同じ編集セッションで確定範囲を基準に選択位置を設定する。
     // クリック・別の入力欄で確定したときは、アプリが動かした所のままにする。
     if (written && !keepAppCaret_) {
         Microsoft::WRL::ComPtr<ITfRange> caretRange;
-        if (SUCCEEDED(range->Clone(&caretRange))) {
+        const HRESULT cloneResult = range->Clone(&caretRange);
+        if (SUCCEEDED(cloneResult)) {
             caretRange->Collapse(ec, TF_ANCHOR_END);
             Microsoft::WRL::ComPtr<ITfRange> target;
             bool inside = false;
@@ -1620,6 +1720,13 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
             caret.style.ase = inside ? TF_AE_END : TF_AE_NONE;
             caret.style.fInterimChar = FALSE;
             const HRESULT result = context->SetSelection(ec, 1, &caret);
+            if (traceCaret) {
+                TipLog(L"括弧検証 同期移動: 内側を指定=%d SetSelection=0x%08lX", inside, static_cast<unsigned long>(result));
+                if (inside) {
+                    LogBracketSelection(context, ec, target.Get(), L"SetSelection後");
+                    if (SUCCEEDED(result)) diagnosticTarget = target;
+                }
+            }
             if (inside && SUCCEEDED(result)) {
                 caretMoved_ = true;
                 if (movedCaret != nullptr) *movedCaret = target.Detach();
@@ -1627,12 +1734,15 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
                 // 内側を指定できない場合も、通常の確定位置から続きの入力を反映する。
                 caret.range = caretRange.Get();
                 caret.style.ase = TF_AE_NONE;
-                context->SetSelection(ec, 1, &caret);
+                const HRESULT tailResult = context->SetSelection(ec, 1, &caret);
+                if (traceCaret) TipLog(L"括弧検証 末尾へ移動: SetSelection=0x%08lX", static_cast<unsigned long>(tailResult));
             }
-            if (caretBack > 0) TipLog(L"括弧内への同期移動: 移動先=%d 結果=0x%08lX", inside, static_cast<unsigned long>(result));
+        } else if (traceCaret) {
+            TipLog(L"括弧検証 同期移動: Clone=0x%08lX", static_cast<unsigned long>(cloneResult));
         }
     }
     EndComposition(ec);
+    if (diagnosticTarget) LogBracketSelection(context, ec, diagnosticTarget.Get(), L"EndComposition後");
     return written;
 }
 

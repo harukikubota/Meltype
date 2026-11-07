@@ -50,30 +50,30 @@ static bool SelfIsMediumOrLower() {
     return level != 0 && level <= SECURITY_MANDATORY_MEDIUM_RID;
 }
 
-void TipLog(const wchar_t* format, ...) {
-    static int enabled = -1;
-    if (enabled < 0 && !SelfIsMediumOrLower()) enabled = 0;
-    if (enabled < 0) {
+bool TipLoggingEnabled() {
+    static const bool enabled = [] {
+        if (!SelfIsMediumOrLower()) return false;
         wchar_t value[8] = {};
-        enabled = GetEnvironmentVariableW(L"MELTYPE_TIP_LOG", value, 8) > 0 && value[0] == L'1' ? 1 : 0;
-        // 環境変数が無ければ、データフォルダーに tip-log という空のファイルがあるときだけ
-        if (!enabled) {
-            wchar_t path[MAX_PATH] = {};
-            if (GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH) > 0) {
-                StringCchCatW(path, MAX_PATH, L"\\Meltype\\tip-log");
-                enabled = GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
-            }
-        }
-    }
-    if (!enabled) return;
+        if (GetEnvironmentVariableW(L"MELTYPE_TIP_LOG", value, ARRAYSIZE(value)) > 0 && value[0] == L'1') return true;
+        wchar_t path[MAX_PATH] = {};
+        DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", path, ARRAYSIZE(path));
+        return length > 0 && length < ARRAYSIZE(path) &&
+            SUCCEEDED(StringCchCatW(path, ARRAYSIZE(path), L"\\Meltype\\tip-log")) &&
+            GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    }();
+    return enabled;
+}
+
+void TipLog(const wchar_t* format, ...) {
+    if (!TipLoggingEnabled()) return;
     wchar_t message[1024];
     va_list args;
     va_start(args, format);
     StringCchVPrintfW(message, ARRAYSIZE(message), format, args);
     va_end(args);
     wchar_t path[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH) == 0) return;
-    StringCchCatW(path, MAX_PATH, L"\\Meltype\\tip.log");
+    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", path, ARRAYSIZE(path));
+    if (length == 0 || length >= ARRAYSIZE(path) || FAILED(StringCchCatW(path, ARRAYSIZE(path), L"\\Meltype\\tip.log"))) return;
     HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
     SYSTEMTIME now;

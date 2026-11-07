@@ -49,7 +49,8 @@ inline void DllRelease() { InterlockedDecrement(&g_locks); }
 std::string ToUtf8(const std::wstring& text);
 std::wstring FromUtf8(const std::string& text);
 
-// デバッグ用のログ (%LOCALAPPDATA%\Meltype\tip.log、MELTYPE_TIP_LOG=1 のときだけ)
+// デバッグ用のログ (%LOCALAPPDATA%\Meltype\tip.log)。環境変数 MELTYPE_TIP_LOG=1 か tip-log ファイルで有効にする。
+bool TipLoggingEnabled();
 void TipLog(const wchar_t* format, ...);
 
 }  // namespace meltype

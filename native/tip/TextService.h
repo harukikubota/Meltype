@@ -80,6 +80,8 @@ public:
 
 private:
     ~TextService();
+    void StartImmDiagnostics();
+    void StopImmDiagnostics();
 
     // test: OnTestKeyDown から (入力欄の種類を読んだ結果を、続く OnKeyDown で使うために覚える)
     bool WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t& ch, bool test);
@@ -183,6 +185,8 @@ private:
     bool fullWidthSpace_ = false;  // 設定「スペースの幅」が全角か (Meltype.exe の応答の fullWidthSpace。日本語入力のときは Space も受け取る)
     ULONGLONG lastHello_ = 0;
     HWND helloWindow_ = nullptr; // IME のスレッドでタイマーを受ける、表示しないウィンドウ
+    HHOOK immSentHook_ = nullptr;
+    HHOOK immQueuedHook_ = nullptr;
     std::shared_ptr<PipeClient> helloPipe_; // 設定取得専用。入力用の pipe_ と同時に使える
     std::future<std::pair<bool, JsonValue>> helloResult_; // 取得中の要求は 1 つだけ。成功したかと応答を保持
     std::shared_ptr<PipeClient> conversionPipe_; // wait 専用。入力用の pipe_ を塞がない
