@@ -521,7 +521,13 @@ internal sealed class TipServer : IDisposable
         if (_stop.IsCancellationRequested) return Inactive;
         var e = request.Event;
         if (e.Field is { } field) e = e with { Field = connection.WithFacts(field) };
+        if (Log.RoutingEnabled)
+            Log.Routing($"TSF core-send instance={e.Instance} clientThread={request.Thread} type={e.Type} app={connection.Process} field={e.Field is not null} composing={e.Field?.Composing} uiaPassword={_composition.Focus.Current.IsPassword}");
+        Log.RoutingEvent("TSF", e);
         var output = connection.Host.Handle(e);
+        if (Log.RoutingEnabled) Log.Routing($"TSF instance={e.Instance} result-json={output.ToJson()}");
+        if (Log.RoutingEnabled)
+            Log.Routing($"TSF core-result instance={e.Instance} clientThread={request.Thread} type={e.Type} consumed={output.Result.Consumed} commits={output.Result.Commits.Count} view={output.Result.View is not null} handles={output.State.HandlesInput} open={output.State.ImeOpen} language={output.State.LanguageMode} revision={output.State.Revision}");
         if (request.Thread != 0) _altKeys[request.Thread] = output.State.HandlesInput && output.State.Capture.AltKeys;
         if (output.State.HandlesInput && connection.Process is { } process) Greet(process);
         if (output.State.ModeIndicatorMs > 0 && request.Thread != 0)

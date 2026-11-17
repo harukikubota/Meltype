@@ -92,14 +92,19 @@ internal static class Native
     {
         var size = System.Runtime.InteropServices.Marshal.SizeOf<INPUT>();
         var offset = 0;
+        var lastError = 0;
         for (var attempt = 0; attempt < 3 && offset < inputs.Length; attempt++)
         {
             if (attempt > 0) Thread.Sleep(15);
             var rest = offset == 0 ? inputs : inputs[offset..];
-            offset += (int)SendInput((uint)rest.Length, rest, size);
+            var sent = SendInput((uint)rest.Length, rest, size);
+            lastError = sent == rest.Length ? 0 : System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+            if (Diagnostics.Log.RoutingEnabled)
+                Diagnostics.Log.Routing($"SendInput kind={what} attempt={attempt} requested={rest.Length} sent={sent} error={lastError}");
+            offset += (int)sent;
         }
         if (offset == inputs.Length) return true;
-        Diagnostics.Log.Error($"{what}に失敗しました ({offset}/{inputs.Length}, Win32 エラー {System.Runtime.InteropServices.Marshal.GetLastWin32Error()})。管理者として動いているアプリには入力できません。");
+        Diagnostics.Log.Error($"{what}に失敗しました ({offset}/{inputs.Length}, Win32 エラー {lastError})。管理者として動いているアプリには入力できません。");
         return false;
     }
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);

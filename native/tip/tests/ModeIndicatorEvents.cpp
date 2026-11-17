@@ -12,6 +12,8 @@ HINSTANCE g_module = nullptr;
 int toggleRequests = 0;
 double revision = 0;
 void TipLog(const wchar_t*, ...) {}
+bool KeyRoutingLogEnabled() { return false; }
+void KeyRoutingLog(const wchar_t*, ...) {}
 std::string ToUtf8(const std::wstring& text) {
     if (text.empty()) return {};
     int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);

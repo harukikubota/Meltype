@@ -135,6 +135,17 @@ bool SameObject(IUnknown* a, IUnknown* b) {
     return ua.Get() == ub.Get();
 }
 
+HRESULT TraceEditResult(const wchar_t* operation, ITfContext* context, HRESULT result) {
+    KeyRoutingLog(L"%s ctx=%p hr=0x%08lX", operation, context, result);
+    return result;
+}
+
+HRESULT ReadSelection(ITfContext* context, TfEditCookie ec, TF_SELECTION* selection, ULONG* fetched) {
+    const HRESULT hr = context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, selection, fetched);
+    KeyRoutingLog(L"GetSelection ctx=%p hr=0x%08lX fetched=%lu range=%p", context, hr, *fetched, selection->range);
+    return hr;
+}
+
 // 変換中の文字の下線を消す (その変換中の文字がある入力欄で)
 void ClearAttributeOf(TfEditCookie ec, ITfComposition* composition) {
     if (composition == nullptr) return;
@@ -189,6 +200,7 @@ HRESULT RunEditSession(ITfContext* context, TfClientId clientId, DWORD flags, st
     auto* session = new EditSession(std::move(action));
     HRESULT result = E_FAIL;
     HRESULT hr = context->RequestEditSession(clientId, session, flags, &result);
+    KeyRoutingLog(L"RequestEditSession ctx=%p flags=0x%lX requestHr=0x%08lX sessionHr=0x%08lX", context, flags, hr, result);
     session->Release();
     return FAILED(hr) ? hr : result;
 }
@@ -262,6 +274,7 @@ STDMETHODIMP TextService::ActivateEx(ITfThreadMgr* threadMgr, TfClientId clientI
     // Meltype.exe より高い権限で動いているアプリ (管理者として動くアプリなど) は、つなぐときに断る (Pipe.cpp の IsTrustedServer)
     disabled_ = (flags & TF_TMAE_SECUREMODE) != 0;
     instance_ = RandomId();
+    KeyRoutingLog(L"Activate instance=%hs impl=%hs disabled=%d", instance_.c_str(), ImplId().c_str(), disabled_);
     TipLog(L"Activate (%s)%s", ProcessName().c_str(), disabled_ ? L" 無効: セキュリティ保護された画面" : L"");
 
     ITfSource* source = nullptr;
@@ -416,7 +429,8 @@ STDMETHODIMP TextService::Deactivate() {
 
 // ---- フォーカス ----
 
-STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr*) {
+STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr* previous) {
+    KeyRoutingLog(L"OnSetFocus document instance=%hs previous=%p next=%p", instance_.c_str(), previous, focus);
     // 別の入力欄に移ったら、変換中の内容は確定する (前の入力欄のキャレットは動かさない)。
     // できればその場で確定する (あとで確定すると、それまでに新しい入力欄で打ったキーが、前の入力欄の変換中の文字に入る)
     if (composition_ != nullptr) {
@@ -435,6 +449,7 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr*) {
 }
 
 STDMETHODIMP TextService::OnSetFocus(BOOL foreground) {
+    KeyRoutingLog(L"OnSetFocus foreground instance=%hs active=%d", instance_.c_str(), foreground);
     if (!foreground && candidates_) candidates_->Hide();
     // 別アプリ (Meltype の設定画面など) から戻ったとき、キー入力の前に状態と設定を受け取り直す
     if (foreground && !disabled_) Sync(true);
@@ -476,6 +491,7 @@ void TextService::UnadviseTextEditSink() {
 }
 
 STDMETHODIMP TextService::OnEndEdit(ITfContext* context, TfEditCookie ec, ITfEditRecord* record) {
+    KeyRoutingLog(L"OnEndEdit instance=%hs ctx=%p own=%d composing=%d", instance_.c_str(), context, ownEdit_, composition_ != nullptr);
     if (record == nullptr) return S_OK;
     // 自分の編集 (確定・変換中の文字) が終わった通知は、キャレットが動いたことにしない
     if (ownEdit_) {
@@ -511,7 +527,7 @@ STDMETHODIMP TextService::OnEndEdit(ITfContext* context, TfEditCookie ec, ITfEdi
     // クリック・矢印などで、キャレットが変換中の文字の外に出たら確定する
     TF_SELECTION selection = {};
     ULONG fetched = 0;
-    if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0) return S_OK;
+    if (FAILED(ReadSelection(context, ec, &selection, &fetched)) || fetched == 0) return S_OK;
     ITfRange* range = nullptr;
     bool outside = false;
     if (SUCCEEDED(composition_->GetRange(&range))) {
@@ -579,7 +595,7 @@ TextService::FieldScope TextService::ReadFieldScope(TfEditCookie ec, ITfContext*
     if (!windowsProperty && !appProperty) return FieldScope::Regular;
     TF_SELECTION selection = {};
     ULONG fetched = 0;
-    if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0) return FieldScope::Regular;
+    if (FAILED(ReadSelection(context, ec, &selection, &fetched)) || fetched == 0) return FieldScope::Regular;
     const wchar_t* failed = nullptr;
     bool secret = false;
     bool appSaysSecret = false;
@@ -761,8 +777,15 @@ bool TextService::Send(const char* type, const std::string& field, const std::st
     request += std::string(",\"event\":{\"version\":") + std::to_string(kImeVersion) + ",\"type\":\"" + type + "\",\"instance\":\"" + instance_ +
                "\",\"imeOpen\":" + (open_ ? "true" : "false") + (field.empty() ? "" : ",\"field\":" + field) + fields + "}}";
     std::string response;
-    if (!pipe_.Transact(request, response, timeoutMs, optional)) return false;
+    KeyRoutingLog(L"Send begin instance=%hs type=%hs optional=%d open=%d", instance_.c_str(), type, optional, open_);
+    if (KeyRoutingLogEnabled()) KeyRoutingLog(L"Send request instance=%hs json=%s", instance_.c_str(), FromUtf8(request).c_str());
+    const bool delivered = pipe_.Transact(request, response, timeoutMs, optional);
+    if (KeyRoutingLogEnabled()) KeyRoutingLog(L"Send response instance=%hs json=%s", instance_.c_str(), FromUtf8(response).c_str());
+    KeyRoutingLog(L"Send transport instance=%hs type=%hs ok=%d", instance_.c_str(), type, delivered);
+    if (!delivered) return false;
     const bool parsed = ParseJson(response, reply);
+    KeyRoutingLog(L"Send reply instance=%hs type=%hs parsed=%d stale=%d consumed=%d commits=%zu view=%d", instance_.c_str(), type,
+        parsed, reply[L"stale"].Bool(), reply[L"result"][L"consumed"].Bool(), reply[L"result"][L"commits"].array.size(), !reply[L"result"][L"view"].IsNull());
     if (parsed && reply[L"stale"].Bool()) {
         // この impl は Meltype.exe と別ビルド: stub に差し替えを要求する (差し替わるまでは、タイムアウトと同じ扱い)
         if (stub_) PostMessageW(stub_, kStubImplStale, 0, 0);
@@ -1003,6 +1026,7 @@ void TextService::RefreshPreservedKeys() {
 
 STDMETHODIMP TextService::OnPreservedKey(ITfContext* context, REFGUID guid, BOOL* eaten) {
     *eaten = FALSE;
+    TraceKey(L"OnPreservedKey begin", context, 0, 0, *eaten, L"pending");
     for (const auto& binding : preservedKeys_) {
         if (!IsEqualGUID(binding.guid, guid)) continue;
         const UINT scan = ToggleShortcut::NormalizeHankakuKey(binding.key.uVKey) == ToggleShortcut::Hankaku || binding.key.uVKey == ToggleShortcut::Grave
@@ -1012,14 +1036,22 @@ STDMETHODIMP TextService::OnPreservedKey(ITfContext* context, REFGUID guid, BOOL
         if (binding.key.uModifiers & TF_MOD_ON_KEYUP) {
             *eaten = eatenDown_[slot] ? TRUE : FALSE;
             eatenDown_[slot] = false;
+            TraceKey(L"OnPreservedKey", context, binding.key.uVKey, keyParam, *eaten, L"up-state");
             return S_OK;
         }
-        if (disabled_ || ContextDisabled(context) || KeyDown(VK_LWIN) || KeyDown(VK_RWIN)) return S_OK;
-        if (!CapturesKey(binding.key.uVKey, keyParam)) return S_OK;
+        if (disabled_ || ContextDisabled(context) || KeyDown(VK_LWIN) || KeyDown(VK_RWIN)) {
+            TraceKey(L"OnPreservedKey", context, binding.key.uVKey, keyParam, *eaten, L"disabled-or-win");
+            return S_OK;
+        }
+        if (!CapturesKey(binding.key.uVKey, keyParam)) {
+            TraceKey(L"OnPreservedKey", context, binding.key.uVKey, keyParam, *eaten, L"not-captured");
+            return S_OK;
+        }
         *eaten = TRUE;
+        TraceKey(L"OnPreservedKey", context, binding.key.uVKey, keyParam, *eaten, L"capture-shortcut");
         const bool repeat = eatenDown_[slot];
         eatenDown_[slot] = true;
-        HandleKey(context, ShortcutKey(binding.key.uVKey, keyParam), 0, repeat, true);
+        HandleKey(context, ShortcutKey(binding.key.uVKey, keyParam), 0, repeat, true, keyParam);
         MaskSystemModifier();
         return S_OK;
     }
@@ -1041,10 +1073,29 @@ void TextService::ForgetSecretField() {
     secretContext_.Reset();
 }
 
-bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t& ch, bool test) {
+void TextService::TraceKey(const wchar_t* stage, ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL eaten, const wchar_t* reason) {
+    if (!KeyRoutingLogEnabled()) return;
+    // 検証専用ビルド: 消費しないキーも含め、実機で受け取ったキーをそのまま記録する。
+    // IUnknown は同じ COM オブジェクトの比較用。入力欄の追加の読み取り・編集要求はしない。
+    Microsoft::WRL::ComPtr<IUnknown> identity;
+    if (context) context->QueryInterface(IID_PPV_ARGS(&identity));
+    GUITHREADINFO gui = {sizeof(gui)};
+    const BOOL guiRead = GetGUIThreadInfo(GetCurrentThreadId(), &gui);
+    const int mods = (KeyDown(VK_SHIFT) ? 1 : 0) | (KeyDown(VK_CONTROL) ? 2 : 0) |
+        (KeyDown(VK_MENU) ? 4 : 0) | (KeyDown(VK_LWIN) || KeyDown(VK_RWIN) ? 8 : 0);
+    KeyRoutingLog(L"%s instance=%hs ctx=%p identity=%p vk=0x%02X scan=0x%02X extended=%d lParam=0x%llX eaten=%d reason=%s mods=%d repeat=%d marked=%d open=%d japanese=%d known=%d active=%d composing=%d compositionCtx=%p guiRead=%d guiFlags=0x%lX focus=%p",
+        stage, instance_.c_str(), context, identity.Get(), static_cast<UINT>(wParam), static_cast<UINT>((lParam >> 16) & 0xFF),
+        (lParam & (1 << 24)) != 0, static_cast<unsigned long long>(lParam), eaten, reason, mods,
+        (static_cast<ULONG_PTR>(lParam) & (static_cast<ULONG_PTR>(1) << 30)) != 0,
+        GetMessageExtraInfo() == static_cast<LPARAM>(kReinjectMarker), open_, state_.japanese,
+        state_.known, state_.Active(), composition_ != nullptr, compositionContext_, guiRead, gui.flags, gui.hwndFocus);
+}
+
+bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t& ch, bool test, const wchar_t*& reason) {
+    auto decision = [&](bool eaten, const wchar_t* why) { reason = why; return eaten; };
     ch = 0;
-    if (disabled_ || vk >= 256) return false;
-    if (IsModifier(vk) && !CapturesKey(vk, lParam)) return false;
+    if (disabled_ || vk >= 256) return decision(false, L"disabled-or-invalid");
+    if (IsModifier(vk) && !CapturesKey(vk, lParam)) return decision(false, L"modifier");
     // アプリが確定した打ちかけの文字があれば、このキーの前に、変換中に戻すか確定したことにする
     ResumeOrCommit(context);
     // VK_PACKET: ほかのソフト (パスワード管理・AutoHotkey など) が送り込んだ文字。送り直せないので受け取らずに通す。
@@ -1052,7 +1103,7 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
     // (同期で確定できなければ、あとで確定する。キャレットは動かさず、前の語も確定し直さない)
     if (vk == VK_PACKET || vk == VK_PROCESSKEY) {
         if (vk == VK_PACKET && composition_ != nullptr && !CommitNow(true)) CommitAsync(true);
-        return false;
+        return decision(false, L"packet-or-processkey");
     }
     if (composition_ != nullptr && compositionContext_ != context) {
         // 変換中の文字が前の入力欄に残っている (フォーカスが移ったときに確定できなかった): 先に確定する。
@@ -1069,7 +1120,7 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
             }
             if (staleCommitTries_ <= 1) {
                 if (!counted) CommitAsync(true);
-                return false;
+                return decision(false, L"previous-context-commit-pending");
             }
             EndCompositionAsync();
             CommittedOutside();
@@ -1077,7 +1128,7 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
     }
     if (state_.input == ServerState::Input::Password) {
         // 同じ入力欄が通常欄へ戻ったときも、最初の打鍵の前に状態を受け取り直す。
-        if (ContextDisabled(context)) return false;
+        if (ContextDisabled(context)) return decision(false, L"password-context-disabled");
         RunEditSession(context, clientId_, TF_ES_SYNC | TF_ES_READ, [&](TfEditCookie ec) {
             std::string field;
             if (ReadField(ec, context, field)) {
@@ -1086,31 +1137,31 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
             }
             return S_OK;
         });
-        if (state_.input == ServerState::Input::Password) return false;
+        if (state_.input == ServerState::Input::Password) return decision(false, L"password-state");
     }
     // 受け取るように言われたキー (Space・半角/全角・切り替えキーなど) は、変換中でもそうでなくても、意味は Meltype.exe が決める
     if (composition_ != nullptr) {
         // IME が無効になったときは、入力欄の種類を読み直して変換を終える。
         // 同期の編集ができなければ、キーの処理で終えてから送り直す。
         if (ContextDisabled(context)) {
-            return !CommitNow(true);
+            return decision(!CommitNow(true), L"disabled-composition-commit");
         }
-        if (CapturesKey(vk, lParam)) return true;
+        if (CapturesKey(vk, lParam)) return decision(true, L"composition-capture");
         // Ctrl・Alt・Windows キーとの組み合わせ (Ctrl + S など): Meltype.exe も確定してアプリに渡すだけなので、ここで確定して
         // 受け取らずに通す (受け取ってから送り直すと、送り直しが届かないアプリでキーが消える)。
         // ここで確定できなければ受け取り、キーの処理の中で確定してから送り直す (キーが先に届いて、確定が後になるのを防ぐ)
         // ただし変換ボックスの中で使う Ctrl+英字 (本体が capture.composing で知らせる) は、確定せずに Meltype.exe に送る
         const bool used = KeyDown(VK_CONTROL) && !KeyDown(VK_MENU) && !KeyDown(VK_LWIN) && !KeyDown(VK_RWIN) &&
             std::find(state_.composing.begin(), state_.composing.end(), vk) != state_.composing.end();
-        if ((KeyDown(VK_CONTROL) || KeyDown(VK_MENU) || KeyDown(VK_LWIN) || KeyDown(VK_RWIN)) && !used && CommitNow()) return false;
-        return true;  // 変換中はほかのキーを全部受け取る (つながらなければ確定して通す)
+        if ((KeyDown(VK_CONTROL) || KeyDown(VK_MENU) || KeyDown(VK_LWIN) || KeyDown(VK_RWIN)) && !used && CommitNow()) return decision(false, L"modified-key-after-commit");
+        return decision(true, L"composing");  // 変換中はほかのキーを全部受け取る (つながらなければ確定して通す)
     }
-    if (CapturesKey(vk, lParam)) return true;
+    if (CapturesKey(vk, lParam)) return decision(true, L"capture-shortcut");
     // 調べるとき用: 文字を生むキーを通した理由 (どのキーかは書かない)
-    auto pass = [&](const wchar_t* reason) {
-        if (passReason_ != reason) TipLog(L"キーを通します: %s", reason);
-        passReason_ = reason;
-        return false;
+    auto pass = [&](const wchar_t* why) {
+        if (passReason_ != why) TipLog(L"キーを通します: %s", why);
+        passReason_ = why;
+        return decision(false, why);
     };
     if (state_.known && !state_.Active()) return pass(L"Meltype.exe が受け持たない");
     if (InMenuMode()) return pass(L"メニューを開いている");
@@ -1140,7 +1191,7 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
     }
     if (scope == FieldScope::Unreadable) return pass(L"種類を読めない入力欄");
     passReason_ = nullptr;
-    return true;
+    return decision(true, L"printable");
 }
 
 bool TextService::IsReinjected(UINT vk) {
@@ -1160,6 +1211,7 @@ bool TextService::IsReinjected(UINT vk) {
         if (marked) markerSeen_ = true;
         else if (markerSeen_) continue;
         bool ours = marked || now - pending.time < 500;
+        KeyRoutingLog(L"IsReinjected instance=%hs vk=0x%02X marked=%d age=%llu ours=%d", instance_.c_str(), vk, marked, now - pending.time, ours);
         pending.vk = 0;
         return ours;
     }
@@ -1167,58 +1219,68 @@ bool TextService::IsReinjected(UINT vk) {
 }
 
 STDMETHODIMP TextService::OnTestKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
+    TraceKey(L"OnTestKeyDown begin", context, wParam, lParam, -1, L"pending");
     UINT vk = static_cast<UINT>(wParam);
     if (IsReinjected(vk)) {
         passVk_ = vk;  // アプリによっては、このあと OnKeyDown も呼ぶ
         passTime_ = GetTickCount64();
         *eaten = FALSE;
+        TraceKey(L"OnTestKeyDown", context, wParam, lParam, *eaten, L"reinjected");
         return S_OK;
     }
     passVk_ = 0;
     wchar_t ch = 0;
-    *eaten = WouldEat(context, vk, lParam, ch, true) ? TRUE : FALSE;
+    const wchar_t* reason = L"unknown";
+    *eaten = WouldEat(context, vk, lParam, ch, true, reason) ? TRUE : FALSE;
+    TraceKey(L"OnTestKeyDown", context, wParam, lParam, *eaten, reason);
     // アプリにそのまま渡すキー (BackSpace・矢印・Enter・Space など) はキャレットを動かす (編集の通知で Meltype.exe に伝える)
     if (!*eaten && !IsModifier(vk)) RememberPassed(context, vk);
     return S_OK;
 }
 
 STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
+    TraceKey(L"OnKeyDown begin", context, wParam, lParam, -1, L"pending");
     UINT vk = static_cast<UINT>(wParam);
     if ((vk == passVk_ && GetTickCount64() - passTime_ < 500) || IsReinjected(vk)) {
         passVk_ = 0;
         *eaten = FALSE;
+        TraceKey(L"OnKeyDown", context, wParam, lParam, *eaten, L"reinjected-or-test-pass");
         return S_OK;
     }
     passVk_ = 0;
     wchar_t ch = 0;
-    if (!WouldEat(context, vk, lParam, ch, false)) {
+    const wchar_t* reason = L"unknown";
+    if (!WouldEat(context, vk, lParam, ch, false, reason)) {
+        TraceKey(L"OnKeyDown", context, wParam, lParam, FALSE, reason);
         if (!IsModifier(vk)) RememberPassed(context, vk);
         *eaten = FALSE;
         return S_OK;
     }
     *eaten = TRUE;
+    TraceKey(L"OnKeyDown", context, wParam, lParam, *eaten, reason);
     const UINT slot = ShortcutSlot(vk, lParam);
     const bool repeat = eatenDown_[slot];
     eatenDown_[slot] = true;
     if (CapturesKey(vk, lParam)) {
-        HandleKey(context, ShortcutKey(vk, lParam), vk == VK_SPACE ? L' ' : 0, repeat, true);
+        HandleKey(context, ShortcutKey(vk, lParam), vk == VK_SPACE ? L' ' : 0, repeat, true, keyParam);
         MaskSystemModifier();
         return S_OK;
     }
-    HandleKey(context, vk, CharOf(vk, lParam), repeat, false);
+    HandleKey(context, vk, CharOf(vk, lParam), repeat, false, lParam);
     return S_OK;
 }
 
-STDMETHODIMP TextService::OnTestKeyUp(ITfContext*, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
+STDMETHODIMP TextService::OnTestKeyUp(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     // VK_KANJI は解放通知が来ない環境があるので、Alt を離したら次の操作を受け付ける。
     if (wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU) {
         eatenDown_[ToggleShortcut::Hankaku] = false;
     }
     *eaten = wParam < 256 && eatenDown_[ShortcutSlot(static_cast<UINT>(wParam), lParam)] ? TRUE : FALSE;
+    TraceKey(L"OnTestKeyUp", context, wParam, lParam, *eaten, L"down-state");
     return S_OK;
 }
 
-STDMETHODIMP TextService::OnKeyUp(ITfContext*, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
+STDMETHODIMP TextService::OnKeyUp(ITfContext* context, WPARAM wParam, LPARAM lParam, BOOL* eaten) {
     // VK_KANJI は解放通知が来ない環境があるので、Alt を離したら次の操作を受け付ける。
     if (wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU) {
         eatenDown_[ToggleShortcut::Hankaku] = false;
@@ -1226,21 +1288,24 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext*, WPARAM wParam, LPARAM lParam, BOO
     const UINT slot = ShortcutSlot(static_cast<UINT>(wParam), lParam);
     *eaten = wParam < 256 && eatenDown_[slot] ? TRUE : FALSE;
     if (wParam < 256) eatenDown_[slot] = false;
+    TraceKey(L"OnKeyUp", context, wParam, lParam, *eaten, L"down-state");
     return S_OK;
 }
 
-void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch, bool repeat, bool listed) {
+void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch, bool repeat, bool listed, LPARAM lParam) {
     // 8 = Windows キー (Meltype.exe は Mac の Command と同じく、確定してアプリに渡す)
     const bool shift = KeyDown(VK_SHIFT), control = KeyDown(VK_CONTROL), alt = KeyDown(VK_MENU), command = KeyDown(VK_LWIN) || KeyDown(VK_RWIN);
     bool failed = false;
     bool consumed = true;
     bool inserted = false;
+    KeyRoutingLog(L"HandleKey begin instance=%hs ctx=%p vk=0x%02X ch=U+%04X scan=0x%02X listed=%d repeat=%d", instance_.c_str(), context, vk, static_cast<UINT>(ch), static_cast<UINT>((lParam >> 16) & 0xFF), listed, repeat);
     HRESULT hr = RunEditSession(context, clientId_, TF_ES_SYNC | TF_ES_READWRITE, [&](TfEditCookie ec) {
         // 受け取る前に読んだ属性は変わることがある。編集セッションで読み直してから打鍵を送る。
         std::string field;
         if (!ReadField(ec, context, field)) {
             if (!field.empty()) FinishPasswordTransition(ec, context);
             consumed = false;
+            KeyRoutingLog(L"HandleKey blocked-field instance=%hs ctx=%p", instance_.c_str(), context);
             TipLog(L"パスワードの入力欄なので何もしません");
             return S_OK;
         }
@@ -1267,7 +1332,7 @@ void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch, bool repea
             if (ch >= 0x20 && !control && !alt && !command) {
                 TF_SELECTION selection = {};
                 ULONG fetched = 0;
-                if (SUCCEEDED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) && fetched > 0) {
+                if (SUCCEEDED(ReadSelection(context, ec, &selection, &fetched)) && fetched > 0) {
                     inserted = WriteCommit(ec, context, selection.range, std::wstring(1, ch));
                     selection.range->Release();
                 }
@@ -1281,7 +1346,7 @@ void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch, bool repea
             result[L"commits"].array.empty() && result[L"view"].IsNull()) {
             TF_SELECTION selection = {};
             ULONG fetched = 0;
-            if (SUCCEEDED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) && fetched > 0) {
+            if (SUCCEEDED(ReadSelection(context, ec, &selection, &fetched)) && fetched > 0) {
                 inserted = WriteCommit(ec, context, selection.range, std::wstring(1, ch));
                 selection.range->Release();
             }
@@ -1305,6 +1370,7 @@ void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch, bool repea
     const bool modeKey = key == ToggleShortcut::Hankaku || key == ToggleShortcut::Grave || key == 0xF0 || key == 0x15;
     if (failed && modeKey && !repeat) pendingOpen_ = key == 0xF0 ? 0 : key == 0x15 ? 1 : open_ ? 0 : 1;
     FlushOpen();
+    KeyRoutingLog(L"HandleKey end instance=%hs ctx=%p hr=0x%08lX failed=%d consumed=%d inserted=%d composing=%d", instance_.c_str(), context, hr, failed, consumed, inserted, composition_ != nullptr);
     // Meltype.exe が使わなかったキーは、アプリに送り直す
     if (!inserted && (failed ? !modeKey : !consumed)) Reinject(vk);
 }
@@ -1366,6 +1432,7 @@ void TextService::RememberPassed(ITfContext* context, UINT vk) {
 }
 
 bool TextService::Reinject(UINT vk) {
+    KeyRoutingLog(L"Reinject begin instance=%hs vk=0x%02X", instance_.c_str(), vk);
     // 受け取ったキーを使わなかった: アプリに送り直す (Ctrl などは押されたままなので、組み合わせもそのまま届く)
     eatenDown_[vk] = false;
     // 前に送り直した同じキーがまだ届いていない (見分けられずに受け取ってしまった) のに、また送り直そうとしている:
@@ -1383,6 +1450,7 @@ bool TextService::Reinject(UINT vk) {
         reinjectGuardCount_ = 0;
     }
     if (previousPending && ++reinjectGuardCount_ > 3) {
+        KeyRoutingLog(L"Reinject guard-stop instance=%hs", instance_.c_str());
         TipLog(L"同じキーの送り直しが続くので、やめます");
         return false;
     }
@@ -1410,9 +1478,12 @@ bool TextService::Reinject(UINT vk) {
         }
     }
     // 送り込みを許されていないとき (UIPI) は、失敗しても分からないことがある。分かったときだけログに書く
-    if (SendInput(2, inputs, sizeof(INPUT)) != 2) {
+    const UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    const DWORD error = sent == 2 ? ERROR_SUCCESS : GetLastError();
+    KeyRoutingLog(L"Reinject result instance=%hs sent=%u expected=2 error=%lu", instance_.c_str(), sent, error);
+    if (sent != 2) {
         slot->vk = 0;
-        TipLog(L"キーをアプリに送り直せません: %lu", GetLastError());
+        TipLog(L"キーをアプリに送り直せません: %lu", error);
         return false;
     }
     return true;
@@ -1432,7 +1503,7 @@ bool TextService::SurroundingText(TfEditCookie ec, ITfContext* context, std::wst
     } else {
         TF_SELECTION selection = {};
         ULONG fetched = 0;
-        const HRESULT hr = context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+        const HRESULT hr = ReadSelection(context, ec, &selection, &fetched);
         if (FAILED(hr) || fetched == 0) return unreadable(L"選択範囲", hr);
         anchor.Attach(selection.range);
     }
@@ -1474,7 +1545,7 @@ RECT TextService::CaretRect(TfEditCookie ec, ITfContext* context) {
     RECT rect = {};
     TF_SELECTION selection = {};
     ULONG fetched = 0;
-    if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0 || selection.range == nullptr) return rect;
+    if (FAILED(ReadSelection(context, ec, &selection, &fetched)) || fetched == 0 || selection.range == nullptr) return rect;
     Microsoft::WRL::ComPtr<ITfRange> range;
     range.Attach(selection.range);
     range->Collapse(ec, selection.style.ase == TF_AE_START ? TF_ANCHOR_START : TF_ANCHOR_END);
@@ -1534,7 +1605,7 @@ void TextService::Apply(TfEditCookie ec, ITfContext* context, const JsonValue& r
         } else {
             TF_SELECTION selection = {};
             ULONG fetched = 0;
-            if (SUCCEEDED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) && fetched > 0) range.Attach(selection.range);
+            if (SUCCEEDED(ReadSelection(context, ec, &selection, &fetched)) && fetched > 0) range.Attach(selection.range);
         }
         if (!range) continue;
         Microsoft::WRL::ComPtr<ITfRange> movedCaret;
@@ -1684,7 +1755,7 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
     if (composition_ == nullptr) {
         ITfContextComposition* contextComposition = nullptr;
         if (SUCCEEDED(context->QueryInterface(IID_ITfContextComposition, reinterpret_cast<void**>(&contextComposition)))) {
-            if (SUCCEEDED(contextComposition->StartComposition(ec, range, static_cast<ITfCompositionSink*>(this), &composition_)) && composition_ != nullptr) {
+            if (SUCCEEDED(TraceEditResult(L"StartComposition", context, contextComposition->StartComposition(ec, range, static_cast<ITfCompositionSink*>(this), &composition_))) && composition_ != nullptr) {
                 compositionContext_ = context;
                 compositionContext_->AddRef();
             }
@@ -1696,7 +1767,7 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
         attribute->Clear(ec, range);
         attribute->Release();
     }
-    const bool written = SUCCEEDED(range->SetText(ec, 0, text.c_str(), static_cast<LONG>(text.size())));
+    const bool written = SUCCEEDED(TraceEditResult(L"SetText", context, range->SetText(ec, 0, text.c_str(), static_cast<LONG>(text.size()))));
     // 同じ編集セッションで確定範囲を基準に選択位置を設定する。
     // クリック・別の入力欄で確定したときは、アプリが動かした所のままにする。
     if (written && !keepAppCaret_) {
@@ -1716,14 +1787,14 @@ bool TextService::WriteCommit(TfEditCookie ec, ITfContext* context, ITfRange* ra
             caret.range = inside ? target.Get() : caretRange.Get();
             caret.style.ase = inside ? TF_AE_END : TF_AE_NONE;
             caret.style.fInterimChar = FALSE;
-            const HRESULT result = context->SetSelection(ec, 1, &caret);
+            const HRESULT result = TraceEditResult(L"SetSelection", context, context->SetSelection(ec, 1, &caret));
             if (inside && SUCCEEDED(result)) {
                 if (movedCaret != nullptr) *movedCaret = target.Detach();
             } else if (inside) {
                 // 内側を指定できない場合も、通常の確定位置から続きの入力を反映する。
                 caret.range = caretRange.Get();
                 caret.style.ase = TF_AE_NONE;
-                context->SetSelection(ec, 1, &caret);
+                TraceEditResult(L"SetSelection", context, context->SetSelection(ec, 1, &caret));
             }
         }
     }
@@ -1736,10 +1807,10 @@ void TextService::ApplyComposition(TfEditCookie ec, ITfContext* context, const J
     if (composition_ == nullptr) {
         TF_SELECTION selection = {};
         ULONG fetched = 0;
-        if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0) return;
+        if (FAILED(ReadSelection(context, ec, &selection, &fetched)) || fetched == 0) return;
         ITfContextComposition* contextComposition = nullptr;
         if (SUCCEEDED(context->QueryInterface(IID_ITfContextComposition, reinterpret_cast<void**>(&contextComposition)))) {
-            if (SUCCEEDED(contextComposition->StartComposition(ec, selection.range, static_cast<ITfCompositionSink*>(this), &composition_)) &&
+            if (SUCCEEDED(TraceEditResult(L"StartComposition", context, contextComposition->StartComposition(ec, selection.range, static_cast<ITfCompositionSink*>(this), &composition_))) &&
                 composition_ != nullptr) {
                 compositionContext_ = context;
                 compositionContext_->AddRef();
@@ -1755,7 +1826,7 @@ void TextService::ApplyComposition(TfEditCookie ec, ITfContext* context, const J
 
     ITfRange* range = nullptr;
     if (FAILED(composition_->GetRange(&range))) return;
-    range->SetText(ec, 0, text.c_str(), static_cast<LONG>(text.size()));
+    TraceEditResult(L"SetText", context, range->SetText(ec, 0, text.c_str(), static_cast<LONG>(text.size())));
 
     // 下線: 変換中は文節ごと (選んでいる文節は太線)、打っている途中は点線
     const auto& clauses = view[L"clauses"].array;
@@ -1787,7 +1858,7 @@ void TextService::ApplyComposition(TfEditCookie ec, ITfContext* context, const J
         caret.range = caretRange;
         caret.style.ase = TF_AE_NONE;
         caret.style.fInterimChar = FALSE;
-        context->SetSelection(ec, 1, &caret);
+        TraceEditResult(L"SetSelection", context, context->SetSelection(ec, 1, &caret));
         caretRange->Release();
     }
     range->Release();
@@ -1828,6 +1899,7 @@ void TextService::EndComposition(TfEditCookie ec) {
 }
 
 STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ec, ITfComposition* composition) {
+    KeyRoutingLog(L"OnCompositionTerminated instance=%hs ctx=%p", instance_.c_str(), compositionContext_);
     // アプリが変換を終えた。欄に表示済みの文字はアプリが保持する。
     // 下線が残らないように (その変換中の文字がある入力欄で消す)
     ClearAttributeOf(ec, composition);
@@ -1905,7 +1977,7 @@ void TextService::ResumeOrCommit(ITfContext* context) {
             if (FAILED(range->GetText(ec, 0, buffer, 64, &length)) || text.compare(0, std::wstring::npos, buffer, length) != 0) return S_OK;
             TF_SELECTION selection = {};
             ULONG fetched = 0;
-            if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0) return S_OK;
+            if (FAILED(ReadSelection(context, ec, &selection, &fetched)) || fetched == 0) return S_OK;
             LONG start = 1, end = 1;
             selection.range->CompareStart(ec, range.Get(), TF_ANCHOR_END, &start);
             selection.range->CompareEnd(ec, range.Get(), TF_ANCHOR_END, &end);

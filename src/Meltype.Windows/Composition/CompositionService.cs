@@ -105,6 +105,7 @@ internal sealed class CompositionService : IDisposable
     /// </summary>
     public void Insert(int count, string text, bool paste)
     {
+        if (Diagnostics.Log.RoutingEnabled) Diagnostics.Log.Routing($"Keyboard commit paste={paste} deletes={count > 0}");
         // 変換ボックスを出したまま確定して、続けて打っている (kyouha Space iitenki): 次に見せるときに、確定した分だけ右へずらす
         if (_window.Visible) _committedWhileVisible += text;
         EnsureSystemImeClosed();
@@ -116,9 +117,11 @@ internal sealed class CompositionService : IDisposable
         DeleteBackward(count);
         if (TryPaste(text.ReplaceLineEndings("\r\n")))
         {
+            if (Diagnostics.Log.RoutingEnabled) Diagnostics.Log.Routing("Keyboard paste success=True");
             Diagnostics.Log.Info($"確定した文字を貼り付けで入力しました ({text.Length} 文字)。");
             return;
         }
+        if (Diagnostics.Log.RoutingEnabled) Diagnostics.Log.Routing("Keyboard paste success=False");
         Diagnostics.Log.Warn("貼り付けられなかったので、1 文字ずつ送ります (改行は Shift+Enter)。");
         foreach (var (line, i) in text.Split('\n').Select((line, i) => (line, i)))
         {

@@ -42,7 +42,12 @@ internal sealed class KeyInjector : IKeyInjector
                 },
             };
         }
-        return Native.SendAll(inputs, "再入力");
+        if (Diagnostics.Log.RoutingEnabled)
+            foreach (var e in events) Diagnostics.Log.Routing($"inject key vk=0x{e.Vk:X2} scan=0x{e.Scan:X2} up={e.IsUp} extended={e.Extended}");
+        var sent = Native.SendAll(inputs, "再入力");
+        if (Diagnostics.Log.RoutingEnabled)
+            Diagnostics.Log.Routing($"inject events={events.Count} allSent={sent}");
+        return sent;
     }
 
     /// <summary>修飾キーと一緒にキーを送る (Ctrl+C など)。</summary>

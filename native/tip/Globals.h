@@ -64,4 +64,8 @@ std::wstring FromUtf8(const std::string& text);
 // デバッグ用のログ (%LOCALAPPDATA%\Meltype\tip.log、MELTYPE_TIP_LOG=1 のときだけ)
 void TipLog(const wchar_t* format, ...);
 
+// 検証専用のキー経路ログ。キー値・通信本文を省略せず記録する。
+bool KeyRoutingLogEnabled();
+void KeyRoutingLog(const wchar_t* format, ...);
+
 }  // namespace meltype

@@ -37,6 +37,55 @@ public static class Log
     /// </summary>
     public static bool RecordText { get; set; }
 
+    /// <summary>キー経路の調査用フラグ。開始・終了時には Meltype と入力先アプリを再起動する。</summary>
+    public static bool RoutingEnabled { get; } = OperatingSystem.IsWindows() &&
+        File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Meltype", "key-routing-log"));
+
+    /// <summary>
+    /// 検証専用ビルドの経路情報を書く。本文・キー値も記録するが、通常ログの設定とは独立させる。
+    /// フックから呼んでもディスクを待たない。
+    /// </summary>
+    public static void Routing(string message)
+    {
+        if (RoutingEnabled) RoutingFile.Enqueue(message);
+    }
+
+    public static void RoutingEvent(string front, Ime.ImeEvent input)
+    {
+        if (RoutingEnabled)
+            Routing($"{front} event-json={System.Text.Json.JsonSerializer.Serialize(input, Ime.ImeJsonContext.Default.ImeEvent)}");
+    }
+
+    private static class RoutingFile
+    {
+        private static readonly ConcurrentQueue<string> Queue = new();
+        private static readonly object FlushGate = new();
+        private static readonly string PathName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Meltype", "key-routing-managed.log");
+        private static readonly System.Threading.Timer Timer = new(_ => Flush(), null, 1000, 1000);
+
+        internal static void Enqueue(string message)
+        {
+            Queue.Enqueue($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [pid={Environment.ProcessId} thread={Environment.CurrentManagedThreadId} tick={Environment.TickCount64}] {message}");
+            GC.KeepAlive(Timer);
+        }
+
+        private static void Flush()
+        {
+            lock (FlushGate)
+            {
+                if (Queue.IsEmpty) return;
+                var builder = new StringBuilder();
+                while (Queue.TryDequeue(out var line)) builder.AppendLine(line);
+                try
+                {
+                    File.AppendAllText(PathName, builder.ToString());
+                }
+                catch (IOException) { /* 診断ログを書けなくても入力は止めない。 */ }
+                catch (UnauthorizedAccessException) { /* 同上。 */ }
+            }
+        }
+    }
+
     /// <summary>入力した文字をログに出すときに使う。RecordText が false なら「(n 文字)」にする。</summary>
     public static string Text(string text) => RecordText ? $"「{text}」" : $"({text.Length} 文字)";
 

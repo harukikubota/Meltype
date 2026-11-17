@@ -97,6 +97,8 @@ internal sealed class KeyboardMonitor : IDisposable
                 if (message is Native.WM_KEYDOWN or Native.WM_SYSKEYDOWN or Native.WM_KEYUP or Native.WM_SYSKEYUP)
                 {
                     var data = Marshal.PtrToStructure<Native.KBDLLHOOKSTRUCT>(lParam);
+                    if (Diagnostics.Log.RoutingEnabled)
+                        Diagnostics.Log.Routing($"hook begin vk=0x{data.vkCode:X2} scan=0x{data.scanCode:X2} flags=0x{data.flags:X} extra=0x{data.dwExtraInfo:X} osTime={data.time}");
                     // 自分が再入力した打鍵は判定対象から除外する (ループ防止)。
                     if (data.dwExtraInfo != InjectedMarker)
                     {
@@ -112,8 +114,14 @@ internal sealed class KeyboardMonitor : IDisposable
                             var thread = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out _);
                             e = e with { UnmodifiedKey = (int)Native.MapVirtualKeyEx(0x29, 3, Native.GetKeyboardLayout(thread)) };
                         }
-                        if (_onKey(e)) return new IntPtr(1);
+                        var eaten = _onKey(e);
+                        // 検証機で受け取った物理・注入イベントを省略せず記録する。
+                        if (Diagnostics.Log.RoutingEnabled)
+                            Diagnostics.Log.Routing($"hook vk=0x{e.Vk:X2} scan=0x{e.Scan:X2} flags=0x{data.flags:X} extra=0x{data.dwExtraInfo:X} osTime={data.time} up={e.IsUp} injected={e.Injected} tipMarker={data.dwExtraInfo == (UIntPtr)0x4D4C5450u} eaten={eaten} foreground=0x{Native.GetForegroundWindow():X}");
+                        if (eaten) return new IntPtr(1);
                     }
+                    else if (Diagnostics.Log.RoutingEnabled)
+                        Diagnostics.Log.Routing($"hook own-injection vk=0x{data.vkCode:X2} scan=0x{data.scanCode:X2} flags=0x{data.flags:X} extra=0x{data.dwExtraInfo:X} osTime={data.time} up={(data.flags & Native.LLKHF_UP) != 0} eaten=False");
                 }
             }
             catch (Exception ex)
@@ -152,6 +160,8 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         try
         {
+            if (Diagnostics.Log.RoutingEnabled)
+                Diagnostics.Log.Routing($"focus-event event=0x{eventType:X} window=0x{hwnd:X} clientThread={thread}");
             if (eventType == Native.EVENT_SYSTEM_FOREGROUND) _onForegroundChanged(hwnd);
             else if (eventType == Native.EVENT_OBJECT_FOCUS) _onFocusChanged();
         }

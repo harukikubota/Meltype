@@ -6,6 +6,8 @@ Windows 版の Meltype を、Windows 正規の IME の仕組み (TSF, Text Servi
 
 使い方は [WINDOWS.md](../WINDOWS.md#meltype-ime-で入力する)、セキュリティの考え方は [SECURITY.md](../../SECURITY.md)。
 
+キーの横取りやセル選択からの入力開始を調べるときは、[Windows キー経路のログ採取](WINDOWS_KEY_ROUTING_DIAGNOSTICS.md) を参照する。
+
 ## 全体の形
 
 ```

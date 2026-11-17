@@ -352,6 +352,8 @@ public sealed class FocusInspector : IDisposable
 
     private void ApplyFocus(long sequence, FocusInfo info, IntPtr affinityWindow)
     {
+        if (Diagnostics.Log.RoutingEnabled)
+            Diagnostics.Log.Routing($"focus-result sequence={sequence} current={sequence == Interlocked.Read(ref _focusSequence)} text={info.IsTextInput} password={info.IsPassword} affinityWindow=0x{affinityWindow:X}");
         _state = new FocusState(info, affinityWindow);
         // 調べている間にまたフォーカスが変わっていたら、この結果は採用しない (次の要求で調べ直す)。
         if (sequence == Interlocked.Read(ref _focusSequence)) Interlocked.Exchange(ref _resolvedSequence, sequence);
@@ -452,6 +454,9 @@ public sealed class FocusInspector : IDisposable
             if (Input.ForegroundTracker.TypingAllowedWindows.ContainsKey(_inspectedForeground) &&
                 Input.ForegroundTracker.DirectInputControls.ContainsKey(new IntPtr(element.NativeWindowHandle))) return new FocusInfo(false, false, null, "Meltype の画面 (横取りしない欄)");
             var type = element.ControlType;
+            // 検証用に、受信した UIA 情報もそのまま残す。
+            if (Diagnostics.Log.RoutingEnabled)
+                Diagnostics.Log.Routing($"focus controlType={type} name={element.Name} class={element.ClassName} password={element.IsPassword} foreground=0x{_inspectedForeground:X} elementWindow=0x{element.NativeWindowHandle:X}");
             var description = $"{ControlTypeName(type)} \"{Trim(element.Name)}\" ({element.ClassName})";
             if (element.IsPassword) return new FocusInfo(true, true, element.Bounds, description);
 

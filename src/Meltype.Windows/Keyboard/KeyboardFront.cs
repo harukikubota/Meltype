@@ -115,6 +115,12 @@ internal sealed class KeyboardFront : IImeEnvironment, IDisposable
     /// <summary>キーを受け取る (true ならアプリに渡さない)。</summary>
     public bool OnKey(KeyEvent e)
     {
+        bool TraceDecision(bool eaten, string reason)
+        {
+            if (Log.RoutingEnabled)
+                Log.Routing($"Keyboard route vk=0x{e.Vk:X2} scan=0x{e.Scan:X2} reason={reason} up={e.IsUp} injected={e.Injected} eaten={eaten} stale={_stale} composing={_composing} waiting={_waiting} busy={_busy} handles={_state.HandlesInput} language={_state.LanguageMode}");
+            return eaten;
+        }
         var repeat = false;
         if (e.IsDown)
         {
@@ -137,19 +143,19 @@ internal sealed class KeyboardFront : IImeEnvironment, IDisposable
         if (altRelease) _alt = 0;
         lock (_gate)
         {
-            if (altRelease) return Enqueue(input with { Event = new ImeKey { Vk = e.Vk, Interrupted = _altInterrupted } });
-            if (_waiting > 0 || _busy || _composing || e.IsUp && _releaseFollows.Contains(e.PhysicalId)) return Enqueue(input);
-            if (e.IsUp) return UpOutside(e);
+            if (altRelease) return TraceDecision(Enqueue(input with { Event = new ImeKey { Vk = e.Vk, Interrupted = _altInterrupted } }), "alt-release");
+            if (_waiting > 0 || _busy || _composing || e.IsUp && _releaseFollows.Contains(e.PhysicalId)) return TraceDecision(Enqueue(input), "queued");
+            if (e.IsUp) return TraceDecision(UpOutside(e), "up-outside");
             if (announce)
             {
                 Enqueue(input with { Key = null, Notice = true });
-                return false;
+                return TraceDecision(false, "alt-announce");
             }
-            if (Captures(e)) return Enqueue(input);
+            if (Captures(e)) return TraceDecision(Enqueue(input), "capture");
             // アプリに通したキーはキャレットを動かすかもしれない (後のキーより先に本体に知らせる)
             if (!VirtualKeys.IsModifier(e.Vk)) Enqueue(new Input(Caret: new ImeCaret { Moved = true, PassedKey = e.Vk, Ctrl = IsDown(VirtualKeys.Control) }));
         }
-        return false;
+        return TraceDecision(false, "pass");
     }
 
     /// <summary>マウスのボタン (true ならアプリに渡さない)。変換中なら、確定してからクリックを送り直す。</summary>
@@ -194,18 +200,23 @@ internal sealed class KeyboardFront : IImeEnvironment, IDisposable
     // Ctrl・Alt・Win と一緒でないキーを本体に聞く (本体が使わなければ送り直す)
     private bool Captures(KeyEvent e)
     {
-        if (VirtualKeys.IsModifier(e.Vk)) return false;
+        bool Decision(bool capture, string reason)
+        {
+            if (Log.RoutingEnabled) Log.Routing($"Keyboard capture={capture} reason={reason}");
+            return capture;
+        }
+        if (VirtualKeys.IsModifier(e.Vk)) return Decision(false, "modifier");
         var state = _state;
         var mods = (IsDown(VirtualKeys.Shift) ? 1 : 0) | (IsDown(VirtualKeys.Control) ? 2 : 0) | (IsDown(VirtualKeys.Menu) ? 4 : 0) |
             (IsDown(VirtualKeys.LWin) || IsDown(VirtualKeys.RWin) ? 8 : 0);
         if (state.HandlesInput && !_stale)
         {
-            if (state.Capture.Shortcuts.Any(key => ToggleShortcut.NormalizeHankakuKey(key.Vk) == ToggleShortcut.NormalizeHankakuKey(e.ShortcutKey) && key.Modifiers == mods)) return true;
-            return (mods & ~1) == 0 && KeyText.CharFromKey(e.Vk, e.Scan, (mods & 1) != 0) is { } c && c is > ' ' and <= '~' &&
-                state.Capture.PrintableAscii && !state.Capture.PrintableAsciiExcept.Contains(c);
+            if (state.Capture.Shortcuts.Any(key => ToggleShortcut.NormalizeHankakuKey(key.Vk) == ToggleShortcut.NormalizeHankakuKey(e.ShortcutKey) && key.Modifiers == mods)) return Decision(true, "shortcut");
+            return Decision((mods & ~1) == 0 && KeyText.CharFromKey(e.Vk, e.Scan, (mods & 1) != 0) is { } c && c is > ' ' and <= '~' &&
+                state.Capture.PrintableAscii && !state.Capture.PrintableAsciiExcept.Contains(c), "printable-policy");
         }
-        if ((mods & ~1) != 0) return false;
-        return _stale || TextFocusRechecked();
+        if ((mods & ~1) != 0) return Decision(false, "modified");
+        return Decision(_stale || TextFocusRechecked(), _stale ? "stale" : "focus-rechecked");
     }
 
     // 並んでいないときに離したキー。本体が使った押下なら、離したこともアプリに通さない
@@ -340,7 +351,18 @@ internal sealed class KeyboardFront : IImeEnvironment, IDisposable
     /// <summary>出来事を送り、返ってきた確定・表示・入力モードを反映する。</summary>
     private ImeOutput Send(ImeEventType type, ImeKey? key = null, ImeCaret? caret = null, bool apply = true, bool readField = true)
     {
-        var output = _host.Handle(new ImeEvent { Version = ImeHost.Version, Type = type, Instance = Instance, Key = key, Caret = caret, Field = readField ? Field() : null });
+        var field = readField ? Field() : null;
+        if (Log.RoutingEnabled)
+        {
+            // 検証用の採取は製品の RecordText 設定から独立させる。
+            Log.Routing($"Keyboard core-send type={type} vk=0x{key?.Vk:X2} ch=U+{key?.Ch:X4} repeat={key?.Repeat} shift={key?.Shift} ctrl={key?.Ctrl} alt={key?.Alt} win={key?.Command} field={field is not null} composing={field?.Composing} app={field?.App} foreground=0x{_foreground.Current.Window:X}");
+        }
+        var input = new ImeEvent { Version = ImeHost.Version, Type = type, Instance = Instance, Key = key, Caret = caret, Field = field };
+        Log.RoutingEvent("Keyboard", input);
+        var output = _host.Handle(input);
+        if (Log.RoutingEnabled) Log.Routing($"Keyboard result-json={output.ToJson()}");
+        if (Log.RoutingEnabled)
+            Log.Routing($"Keyboard core-result type={type} consumed={output.Result.Consumed} commits={output.Result.Commits.Count} view={output.Result.View is not null} handles={output.State.HandlesInput} open={output.State.ImeOpen} language={output.State.LanguageMode} revision={output.State.Revision}");
         var wasMode = _state.LanguageMode;
         _state = output.State;
         _stale = false;

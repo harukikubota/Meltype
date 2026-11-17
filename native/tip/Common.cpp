@@ -6,6 +6,7 @@
 #include <strsafe.h>
 
 #include <cstdarg>
+#include <cstdio>
 
 #include "Globals.h"
 
@@ -46,6 +47,63 @@ static bool SelfIsMediumOrLower() {
     return level != 0 && level <= SECURITY_MANDATORY_MEDIUM_RID;
 }
 
+static void WriteLog(const wchar_t* filename, const wchar_t* format, va_list args, bool routing) {
+    // 検証時の JSON 応答も途中で切らない。通常の tip.log は従来の長さのまま。
+    va_list measured;
+    va_copy(measured, args);
+    const int length = routing ? _vscwprintf(format, measured) : 1023;
+    va_end(measured);
+    if (length < 0) return;
+    std::vector<wchar_t> message(static_cast<size_t>(length) + 1);
+    StringCchVPrintfW(message.data(), message.size(), format, args);
+    wchar_t path[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH) == 0) return;
+    StringCchCatW(path, MAX_PATH, L"\\Meltype\\");
+    StringCchCatW(path, MAX_PATH, filename);
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const wchar_t* name = wcsrchr(exe, L'\\');
+    std::vector<wchar_t> line(message.size() + 512);
+    if (routing) {
+        StringCchPrintfW(line.data(), line.size(), L"%04d-%02d-%02d %02d:%02d:%02d.%03d [%s pid=%lu tid=%lu tick=%llu] %s\r\n",
+            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, name ? name + 1 : exe,
+            GetCurrentProcessId(), GetCurrentThreadId(), GetTickCount64(), message.data());
+    } else {
+        StringCchPrintfW(line.data(), line.size(), L"%02d:%02d:%02d.%03d [%s %lu] %s\r\n",
+            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, name ? name + 1 : exe, GetCurrentThreadId(), message.data());
+    }
+    std::string utf8 = ToUtf8(line.data());
+    DWORD written = 0;
+    WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    CloseHandle(file);
+}
+
+bool KeyRoutingLogEnabled() {
+    static const bool enabled = [] {
+        if (!SelfIsMediumOrLower()) return false;
+        wchar_t path[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH) == 0) return false;
+        StringCchCatW(path, MAX_PATH, L"\\Meltype\\key-routing-log");
+        return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    }();
+    return enabled;
+}
+
+void KeyRoutingLog(const wchar_t* format, ...) {
+    const DWORD error = GetLastError();
+    if (KeyRoutingLogEnabled()) {
+        va_list args;
+        va_start(args, format);
+        WriteLog(L"key-routing-tip.log", format, args, true);
+        va_end(args);
+    }
+    SetLastError(error);
+}
+
 void TipLog(const wchar_t* format, ...) {
     static int enabled = -1;
     if (enabled < 0 && !SelfIsMediumOrLower()) enabled = 0;
@@ -62,28 +120,10 @@ void TipLog(const wchar_t* format, ...) {
         }
     }
     if (!enabled) return;
-    wchar_t message[1024];
     va_list args;
     va_start(args, format);
-    StringCchVPrintfW(message, ARRAYSIZE(message), format, args);
+    WriteLog(L"tip.log", format, args, false);
     va_end(args);
-    wchar_t path[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH) == 0) return;
-    StringCchCatW(path, MAX_PATH, L"\\Meltype\\tip.log");
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    const wchar_t* name = wcsrchr(exe, L'\\');
-    wchar_t line[1400];
-    StringCchPrintfW(line, ARRAYSIZE(line), L"%02d:%02d:%02d.%03d [%s %lu] %s\r\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
-                     name ? name + 1 : exe, GetCurrentThreadId(), message);
-    std::string utf8 = ToUtf8(line);
-    DWORD written = 0;
-    WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
-    CloseHandle(file);
 }
 
 }  // namespace meltype
